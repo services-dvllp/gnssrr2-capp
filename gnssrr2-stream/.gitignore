@@ -1,0 +1,15 @@
+# User-space build outputs (rx_stream/tx_stream are built per-architecture on
+# the board; do not commit binaries). Keep the build/ directory itself.
+/build/*
+!/build/.gitkeep
+
+# Kernel module build artifacts (from `make driver`)
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+.*.cmd
+modules.order
+Module.symvers
+.tmp_versions/
