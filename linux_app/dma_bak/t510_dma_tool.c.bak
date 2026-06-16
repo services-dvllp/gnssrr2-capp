@@ -1,0 +1,314 @@
+#include <errno.h>
+#include <fcntl.h>
+#include <getopt.h>
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
+#include "t510_dma_ioctl.h"
+
+#define DEFAULT_DEVICE       "/dev/t510_dma_loopback"
+#define DEFAULT_CAPTURE_MS   1000U
+#define DEFAULT_PREVIEW_PAIRS 16U
+#define SAMPLES_PER_BLOCK    8U
+
+static const int16_t BaseIqData[] = {
+#include "iq_data_intr.h"
+};
+
+#define UNIQUE_SAMPLES \
+    (sizeof(BaseIqData) / sizeof(BaseIqData[0]))
+	
+static void usage(const char *prog)
+{
+    fprintf(stderr,
+            "Usage: %s [options]\n"
+            "  --device PATH        DMA device (default " DEFAULT_DEVICE ")\n"
+            "  --capture-ms N       capture duration in ms (default %u)\n"
+            "  --csv PATH           write all IQ pairs as CSV (use - for stdout)\n"
+            "  --bin PATH           write raw RX buffer to file\n"
+            "  --preview N          print first N IQ pairs (default %u)\n"
+            "  --status-only        print DMA status only\n",
+            prog, DEFAULT_CAPTURE_MS, DEFAULT_PREVIEW_PAIRS);
+}
+
+static void format_tx_buffer_from_generated_tone(int16_t *tx_buf)
+{
+    int16_t base[T510_DMA_UNIQUE_SAMPLES];
+    unsigned src_idx = 0;
+    unsigned dst_idx = 0;
+
+    for (unsigned i = 0; i < T510_DMA_UNIQUE_SAMPLES; ++i) {
+        double angle = (2.0 * M_PI * (double)i) / (double)T510_DMA_UNIQUE_SAMPLES;
+        base[i] = (int16_t)lrint(8191.0 * sin(angle));
+    }
+
+    while (src_idx < T510_DMA_UNIQUE_SAMPLES) {
+        for (unsigned i = 0; i < SAMPLES_PER_BLOCK; ++i)
+            tx_buf[dst_idx++] = base[src_idx + i];
+        for (unsigned i = 0; i < SAMPLES_PER_BLOCK; ++i)
+            tx_buf[dst_idx++] = base[src_idx + i];
+        src_idx += SAMPLES_PER_BLOCK;
+    }
+	// --- ADD THIS DEBUG BLOCK ---
+    printf("DEBUG: First 16 samples generated in User-Space tx_buf:\n");
+    for (unsigned i = 0; i < 16; i++) {
+        // We print index and the value. 
+        // Since it's IQ interleaved, index 0 is I, index 1 is Q, etc.
+        printf("  tx_buf[%u] = %d\n", i, tx_buf[i]);
+    }
+}
+
+
+static void format_tx_buffer_exact(int16_t *tx_buf)
+{
+    int src_idx = 0;
+    int dst_idx = 0;
+
+    while ((src_idx + 8) <= UNIQUE_SAMPLES) {
+
+        /* First 8 samples */
+        for (int i = 0; i < 8; i++) {
+            tx_buf[dst_idx++] = BaseIqData[src_idx + i];
+        }
+
+        /* Duplicate same 8 samples */
+        for (int i = 0; i < 8; i++) {
+            tx_buf[dst_idx++] = BaseIqData[src_idx + i];
+        }
+
+        src_idx += 8;
+    }
+}
+
+static int write_full(int fd, const void *buf, size_t len)
+{
+    const uint8_t *p = buf;
+    size_t done = 0;
+
+    while (done < len) {
+        ssize_t rc = write(fd, p + done, len - done);
+        if (rc < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        done += (size_t)rc;
+    }
+    return 0;
+}
+
+static int read_full(int fd, void *buf, size_t len)
+{
+    uint8_t *p = buf;
+    size_t done = 0;
+
+    while (done < len) {
+        ssize_t rc = read(fd, p + done, len - done);
+        if (rc < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (rc == 0)
+            break;
+        done += (size_t)rc;
+    }
+    return (done == len) ? 0 : -1;
+}
+
+static void print_preview(const int16_t *rx_buf, unsigned preview_pairs)
+{
+    printf("Preview of first %u IQ pairs:\n", preview_pairs);
+    printf("index,I_Data,Q_Data\n");
+    for (unsigned i = 0; i < preview_pairs; ++i)
+        printf("%u,%d,%d\n", i, rx_buf[i * 2], rx_buf[i * 2 + 1]);
+}
+
+static int dump_csv(const char *path, const int16_t *rx_buf)
+{
+    FILE *fp = NULL;
+
+    if (strcmp(path, "-") == 0)
+        fp = stdout;
+    else
+        fp = fopen(path, "w");
+
+    if (!fp) {
+        perror("fopen(csv)");
+        return -1;
+    }
+
+    fprintf(fp, "I_Data,Q_Data\n");
+    for (unsigned i = 0; i < T510_DMA_TOTAL_SAMPLES; i += 2)
+        fprintf(fp, "%d,%d\n", rx_buf[i], rx_buf[i + 1]);
+
+    if (fp != stdout)
+        fclose(fp);
+    return 0;
+}
+
+static int dump_bin(const char *path, const int16_t *rx_buf)
+{
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        perror("fopen(bin)");
+        return -1;
+    }
+    if (fwrite(rx_buf, 1, T510_DMA_BUFFER_BYTES, fp) != T510_DMA_BUFFER_BYTES) {
+        perror("fwrite(bin)");
+        fclose(fp);
+        return -1;
+    }
+    fclose(fp);
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    static const struct option long_opts[] = {
+        { "device", required_argument, NULL, 'd' },
+        { "capture-ms", required_argument, NULL, 'c' },
+        { "csv", required_argument, NULL, 'o' },
+        { "bin", required_argument, NULL, 'b' },
+        { "preview", required_argument, NULL, 'p' },
+        { "status-only", no_argument, NULL, 's' },
+        { NULL, 0, NULL, 0 }
+    };
+
+    const char *device_path = DEFAULT_DEVICE;
+    const char *csv_path = NULL;
+    const char *bin_path = NULL;
+    unsigned capture_ms = DEFAULT_CAPTURE_MS;
+    unsigned preview_pairs = DEFAULT_PREVIEW_PAIRS;
+    int status_only = 0;
+    int fd = -1;
+    int16_t tx_buf[T510_DMA_TOTAL_SAMPLES];
+    int16_t rx_buf[T510_DMA_TOTAL_SAMPLES];
+    struct t510_dma_status status;
+    int opt;
+
+    while ((opt = getopt_long(argc, argv, "d:c:o:b:p:s", long_opts, NULL)) != -1) {
+        switch (opt) {
+        case 'd':
+            device_path = optarg;
+            break;
+        case 'c':
+            capture_ms = (unsigned)strtoul(optarg, NULL, 10);
+			printf("DEBUG: capture_ms=%u\n", capture_ms);
+            break;
+        case 'o':
+            csv_path = optarg;
+            break;
+        case 'b':
+            bin_path = optarg;
+            break;
+        case 'p':
+            preview_pairs = (unsigned)strtoul(optarg, NULL, 10);
+            break;
+        case 's':
+            status_only = 1;
+            break;
+        default:
+            usage(argv[0]);
+            return EXIT_FAILURE;
+        }
+    }
+
+    fd = open(device_path, O_RDWR);
+    if (fd < 0) {
+        perror("open");
+        return EXIT_FAILURE;
+    }
+
+    if (ioctl(fd, T510_DMA_IOC_STATUS, &status) != 0) {
+        perror("ioctl(status)");
+        close(fd);
+        return EXIT_FAILURE;
+    }
+
+    printf("DMA status: running=%u tx_periods=%llu rx_periods=%llu buffer=%u period=%u\n",
+           status.running,
+           (unsigned long long)status.tx_periods,
+           (unsigned long long)status.rx_periods,
+           status.buffer_bytes,
+           status.period_bytes);
+
+    if (status_only) {
+        close(fd);
+        return EXIT_SUCCESS;
+    }
+
+    //format_tx_buffer_from_generated_tone(tx_buf);
+	format_tx_buffer_exact(tx_buf);
+	printf("DEBUG: First 32 TX samples:\n");
+	for (int i = 0; i < 32; i++) {
+		printf("tx_buf[%d] = %d\n", i, tx_buf[i]);
+	}
+    if (lseek(fd, 0, SEEK_SET) < 0) {
+        perror("lseek(tx)");
+        close(fd);
+        return EXIT_FAILURE;
+    }
+    if (write_full(fd, tx_buf, T510_DMA_BUFFER_BYTES) != 0) {
+        perror("write(tx)");
+        close(fd);
+        return EXIT_FAILURE;
+    }
+
+    if (ioctl(fd, T510_DMA_IOC_START) != 0) {
+        perror("ioctl(start)");
+        close(fd);
+        return EXIT_FAILURE;
+    }
+
+    printf("DMA capture started for %u ms...\n", capture_ms);
+    usleep(capture_ms * 1000U);
+
+    if (ioctl(fd, T510_DMA_IOC_STATUS, &status) != 0) {
+        perror("ioctl(status-after-start)");
+        close(fd);
+        return EXIT_FAILURE;
+    }
+    printf("During capture: tx_periods=%llu rx_periods=%llu\n",
+           (unsigned long long)status.tx_periods,
+           (unsigned long long)status.rx_periods);
+
+    if (ioctl(fd, T510_DMA_IOC_STOP) != 0) {
+        perror("ioctl(stop)");
+        close(fd);
+        return EXIT_FAILURE;
+    }
+
+    if (lseek(fd, 0, SEEK_SET) < 0) {
+        perror("lseek(rx)");
+        close(fd);
+        return EXIT_FAILURE;
+    }
+    if (read_full(fd, rx_buf, T510_DMA_BUFFER_BYTES) != 0) {
+        perror("read(rx)");
+        close(fd);
+        return EXIT_FAILURE;
+    }
+
+    if (preview_pairs > (T510_DMA_TOTAL_SAMPLES / 2U))
+        preview_pairs = T510_DMA_TOTAL_SAMPLES / 2U;
+    print_preview(rx_buf, preview_pairs);
+
+    if (csv_path && dump_csv(csv_path, rx_buf) != 0) {
+        close(fd);
+        return EXIT_FAILURE;
+    }
+
+    if (bin_path && dump_bin(bin_path, rx_buf) != 0) {
+        close(fd);
+        return EXIT_FAILURE;
+    }
+
+    close(fd);
+    return EXIT_SUCCESS;
+}

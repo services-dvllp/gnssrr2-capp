@@ -1,0 +1,3 @@
+# Build artefacts from the linux_app Makefile
+*.o
+/t510_rf_init

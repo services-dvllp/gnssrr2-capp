@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="ASCII"?>
+<sdkproject:SdkProject xmi:version="2.0" xmlns:xmi="http://www.omg.org/XMI" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:sdkproject="http://www.xilinx.com/sdkproject" name="antsdr_t510_rf_loop_app" location="J:/antsdr_t510_standalone/vitis/antsdr_t510_rf_loop_app" platform="J:/antsdr_t510_standalone/vitis/t510_standalone_top/export/t510_standalone_top/t510_standalone_top.xpfm" platformUID="xilinx:::0.0(custom)" systemProject="antsdr_t510_rf_loop_app_system" sysConfig="t510_standalone_top" runtime="cpp" cpu="standalone_psu_cortexa53_0" cpuInstance="psu_cortexa53_0" os="standalone" mssSignature="8463de458946b1376fa26bc1ae23cd54">
+  <configuration name="Debug" id="xilinx.gnu.arm.a53.exe.debug.1941854672">
+    <configBuildOptions xsi:type="sdkproject:SdkOptions"/>
+    <lastBuildOptions xsi:type="sdkproject:SdkOptions"/>
+  </configuration>
+  <configuration name="Release" id="xilinx.gnu.arm.a53.exe.release.974987433" dirty="true">
+    <configBuildOptions xsi:type="sdkproject:SdkOptions"/>
+  </configuration>
+  <template appTemplateName="empty_application"/>
+</sdkproject:SdkProject>
