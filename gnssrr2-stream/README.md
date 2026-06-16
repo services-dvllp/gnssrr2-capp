@@ -20,9 +20,10 @@ This folder is self-contained: copy `gnssrr2-stream/` to the board and build.
 
 ```
 gnssrr2-stream/
-├── Makefile                 # builds rx_stream + tx_stream into build/
+├── Makefile                 # `make` builds all 4 artifacts into build/
 ├── README.md
-├── build/                   # generated binaries land here (per-arch)
+├── build/                   # all outputs land here (per-arch, git-ignored):
+│                            #   rx_stream tx_stream t510_rf_init t510_dma_stream.ko
 ├── app/
 │   ├── rx_stream.c          # capture app  (positional CLI, 512B header, stopg)
 │   ├── tx_stream.c          # replay app   (positional CLI, header inherit, stopg)
@@ -30,10 +31,11 @@ gnssrr2-stream/
 ├── driver/
 │   ├── t510_dma_stream.c        # cyclic-DMA kernel module (from dma/v2/driver)
 │   ├── t510_dma_stream_ioctl.h  # shared driver/app ABI
-│   └── Makefile                 # module build (needs KDIR)
+│   └── Makefile                 # module build (default KDIR = standard location)
 └── rfdc/                    # RFDC bring-up, vendored from linux_app
     ├── rfdc_init.c          # main_linux.c with main() -> rfdc_init() (only change)
     ├── rfdc_init.h
+    ├── rfdc_main.c          # main() for the standalone t510_rf_init tool (NEW)
     ├── metal_stub.c, metal/*.h, devices/*, lmk04828/*, rfsoc/*
     ├── rfdc_src/*           # Xilinx XRFdc driver (xrfdc*.c/.h)
     └── x*.h                 # xparameters / xil_* / xrfdc_linux headers
@@ -41,24 +43,32 @@ gnssrr2-stream/
 
 ## Build
 
-User-space apps (native on the aarch64 board):
+On the board (native aarch64), `make` builds **everything** into `build/` —
+the two apps, the standalone RFDC-init tool, and the kernel module:
 
 ```bash
-cd gnssrr2-stream
+cd /home/gnssrr2-stream
 make clean
 make
-# -> build/rx_stream, build/tx_stream
+# -> build/rx_stream  build/tx_stream  build/t510_rf_init  build/t510_dma_stream.ko
 ```
 
-Cross-compiling from x86: `make CC=aarch64-linux-gnu-gcc`.
-
-Kernel module (separate; needs a matching kernel build tree, same `KDIR` you
-use for the rest of the project):
+The kernel module is built against `KDIR`, which defaults to
+`/lib/modules/$(uname -r)/build` — the same standard location the existing
+`t510_dma_loopback` driver builds against on this board, so no path needs to be
+passed. Override it only if your kernel source tree lives elsewhere:
 
 ```bash
-make driver KDIR=/path/to/petalinux_proj/.../kernel-source ARCH=arm64 \
-     CROSS_COMPILE=aarch64-linux-gnu-
-# -> driver/t510_dma_stream.ko
+make KDIR=/path/to/your/kernel-source
+```
+
+Other targets:
+
+```bash
+make apps                       # user-space only (no kernel tree needed)
+make apps CC=aarch64-linux-gnu-gcc   # cross-compile the apps from x86
+make driver                     # kernel module only
+make clean                      # remove all build artifacts
 ```
 
 ## Load the driver (once per boot)
@@ -68,7 +78,7 @@ only one may be loaded at a time:
 
 ```bash
 rmmod t510_dma_loopback 2>/dev/null
-insmod driver/t510_dma_stream.ko          # optional: num_periods=32 period_bytes=1048576
+insmod build/t510_dma_stream.ko           # optional: num_periods=32 period_bytes=1048576
 # /dev/t510_dma_stream now exists
 ```
 

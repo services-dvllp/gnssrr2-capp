@@ -1,21 +1,27 @@
 # =============================================================================
-# gnssrr2-stream - continuous RX/TX streaming apps for the ANTSDR T510 RFSoC.
+# gnssrr2-stream - continuous RX/TX streaming for the ANTSDR T510 RFSoC.
 #
-# Builds two standalone user-space binaries into build/:
-#   build/rx_stream   continuous RFDC capture  -> SSD file (512-byte header + IQ)
-#   build/tx_stream   continuous RFDC replay   <- SSD file
+# `make` builds EVERYTHING into build/:
+#   build/rx_stream            continuous RFDC capture  -> SSD file
+#   build/tx_stream            continuous RFDC replay   <- SSD file
+#   build/t510_rf_init         standalone RFDC bring-up tool (same init the
+#                              apps run in-process; -t / --skip-mts CLI)
+#   build/t510_dma_stream.ko   loadable cyclic-DMA kernel module
 #
-# Each app links the in-process RFDC bring-up (rfdc/rfdc_init.c, vendored from
-# the linux_app t510_rf_init sources) so RFDC init runs at startup; no separate
-# t510_rf_init run is needed.
-#
-# Build (native, on the aarch64 board):   make
-# Cross-compile from x86:                 make CC=aarch64-linux-gnu-gcc
-# Kernel module (separate, needs KDIR):   make driver KDIR=/path/to/kernel-source
+# On the board (native aarch64), just:   make clean && make
+# App-only build (no kernel tree):        make apps
+# Override the kernel build tree:         make KDIR=/path/to/kernel-source
+# Cross-compile the user-space parts:     make apps CC=aarch64-linux-gnu-gcc
 # =============================================================================
 
 CC      ?= gcc
 CFLAGS  ?= -O2 -Wall -Wextra -std=gnu11
+
+# Kernel build tree for the module. Default is the standard location populated
+# by the kernel-headers package (same default the v1/v2 driver Makefiles use,
+# and the one the board already builds t510_dma_loopback against). Override on
+# the command line only if your kernel source lives elsewhere.
+KDIR    ?= /lib/modules/$(shell uname -r)/build
 
 BUILD   := build
 OBJ     := $(BUILD)/obj
@@ -30,8 +36,9 @@ APP_INC     := -Iapp -Idriver -Irfdc
 
 LDLIBS      := -lm
 
-# --- RFDC object set, shared by both apps (mirrors linux_app/Makefile list,
-#     with main_linux.c replaced by rfdc_init.c) ---
+# --- shared RFDC object set (mirrors linux_app/Makefile, main_linux.c replaced
+#     by rfdc_init.c). rfdc_main.c is intentionally NOT here: it provides main()
+#     for the standalone tool only, and must not be linked into the apps. ---
 RFDC_SRCS := \
     rfdc/rfdc_init.c \
     rfdc/metal_stub.c \
@@ -53,16 +60,29 @@ RFDC_OBJS := $(patsubst rfdc/%.c,$(OBJ)/%.o,$(RFDC_SRCS))
 
 APP_HDRS  := app/rtx_config.h rfdc/rfdc_init.h driver/t510_dma_stream_ioctl.h
 
-.PHONY: all clean driver driver-clean fix-mtime
+BINS := $(BUILD)/rx_stream $(BUILD)/tx_stream $(BUILD)/t510_rf_init
 
-all: fix-mtime $(BUILD)/rx_stream $(BUILD)/tx_stream
-	@echo "Built: $(BUILD)/rx_stream $(BUILD)/tx_stream"
+.PHONY: all apps driver clean fix-mtime
 
-# --- link the two apps (each: its own app object + the shared RFDC objects) ---
+# Default: build the user-space binaries AND the kernel module.
+all: apps driver
+	@echo "Built: $(BINS) $(BUILD)/t510_dma_stream.ko"
+
+# User-space only (rx_stream, tx_stream, t510_rf_init) - no kernel tree needed.
+apps: fix-mtime $(BINS)
+	@echo "Built: $(BINS)"
+
+# --- link the three user-space binaries ---
 $(BUILD)/rx_stream: $(OBJ)/app/rx_stream.o $(RFDC_OBJS)
+	@mkdir -p $(@D)
 	$(CC) $^ $(LDLIBS) -o $@
 
 $(BUILD)/tx_stream: $(OBJ)/app/tx_stream.o $(RFDC_OBJS)
+	@mkdir -p $(@D)
+	$(CC) $^ $(LDLIBS) -o $@
+
+$(BUILD)/t510_rf_init: $(OBJ)/rfdc_main.o $(RFDC_OBJS)
+	@mkdir -p $(@D)
 	$(CC) $^ $(LDLIBS) -o $@
 
 # --- app objects (simple POSIX flags) ---
@@ -70,24 +90,21 @@ $(OBJ)/app/%.o: app/%.c $(APP_HDRS)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(APP_INC) -c $< -o $@
 
-# --- RFDC objects (baremetal XRFdc flags + include paths) ---
+# --- RFDC objects, incl. rfdc_main.o (baremetal XRFdc flags + include paths) ---
 $(OBJ)/%.o: rfdc/%.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(RFDC_CFLAGS) $(RFDC_INC) -c $< -o $@
 
-# --- kernel module passthrough (needs a kernel build tree via KDIR) ---
-# Kept separate from `all`/`clean` so the user-space build never needs kernel
-# headers. Build the module with:  make driver KDIR=/path/to/kernel-source
+# --- kernel module: build in driver/, then drop the .ko into build/ ---
 driver:
-	$(MAKE) -C driver
+	$(MAKE) -C driver KDIR=$(KDIR)
+	@mkdir -p $(BUILD)
+	cp -f driver/t510_dma_stream.ko $(BUILD)/
+	@echo "Built: $(BUILD)/t510_dma_stream.ko"
 
-driver-clean:
-	$(MAKE) -C driver clean
-
-# Clean only the user-space build (the kernel module has its own driver-clean,
-# which is not invoked here because it requires KDIR to be valid).
 clean:
-	rm -rf $(BUILD)/rx_stream $(BUILD)/tx_stream $(OBJ)
+	rm -rf $(BINS) $(BUILD)/t510_dma_stream.ko $(OBJ)
+	-$(MAKE) -C driver KDIR=$(KDIR) clean
 
 # The board's RTC can drift behind the checked-out file mtimes, making GNU make
 # emit "modification time in the future" / "Clock skew detected" and skip
