@@ -1502,8 +1502,8 @@
 		reg = <0x00 0x00 0x00 0x7ff00000 0x08 0x00 0x00 0x80000000>;
 	};
 
-	t510_dma_loopback {
-		compatible = "antsdr,t510-dma-loopback";
+	t510_dma_stream {
+		compatible = "antsdr,t510-dma-stream";
 		dmas = <0x1d 0x00 0x1d 0x01>;
 		dma-names = "tx\0rx";
 	};
