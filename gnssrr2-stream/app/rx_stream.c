@@ -3,9 +3,8 @@
  * /dev/t510_dma_stream, with an embedded self-describing 512-byte header.
  *
  * Lineage: the DMA ring-draining core (START_RX, GET_STATUS/WAIT_RX, the
- * overrun detect-and-resync, the period copy-out with a 1 MiB buffered FILE*)
- * is preserved from linux_app/dma/v2/app/rx_stream.c. The changes required by
- * this task are:
+ * overrun detect-and-resync, the period copy-out) is preserved from
+ * linux_app/dma/v2/app/rx_stream.c. The changes required by this task are:
  *
  *   1. RFDC bring-up is run IN-PROCESS at startup via rfdc_init() (vendored
  *      from main_linux.c / t510_rf_init) instead of relying on the user
@@ -15,6 +14,24 @@
  *      written before any IQ, and rewritten on exit with the final IQ byte
  *      count. (v2 instead wrote a separate text --meta file.)
  *   4. The SIGINT/SIGTERM stop flag is named `stopg`, per the task.
+ *   5. The SSD write path uses O_DIRECT instead of a buffered FILE*. At the
+ *      ~983 MB/s DMA rate the page cache fills faster than NVMe writeback can
+ *      drain it, so the kernel throttles the writer (dirty-ratio balancing);
+ *      that back-pressure stalls the drain loop, the ring overruns, and the
+ *      capture file ends up far smaller than expected (only the periods that
+ *      were actually written survive). O_DIRECT bypasses the page cache so the
+ *      write cost is bounded by the SSD itself, and completed periods are
+ *      coalesced into one large write per drain to cut syscall overhead.
+ *
+ *      O_DIRECT requires block-aligned buffer / length / file-offset and a
+ *      pinnable (GUP-able) source buffer. The DMA ring is a dma_mmap_coherent
+ *      mapping (VM_PFNMAP, non-cacheable) which O_DIRECT cannot pin, so periods
+ *      are memcpy'd from the ring into a page-aligned RAM bounce buffer first
+ *      (the old buffered FILE* did an equivalent copy into its stdio buffer).
+ *      The 512-byte header keeps the IQ payload at file offset 512; that is a
+ *      multiple of a 512-byte logical sector, so O_DIRECT works on the usual
+ *      512e NVMe. On a 4Kn device the 512-byte header write returns EINVAL and
+ *      the code transparently falls back to a buffered (page-cache) write.
  *
  * The RF parameters (LO/BW/Fs/ADC-bits/Gain, per channel) are accepted and
  * stored in the header for self-description only. They are NOT pushed into the
@@ -23,6 +40,10 @@
  * these CLI values would require inventing driver behavior that does not exist.
  * The samples are always the raw int16 IQ stream the DMA delivers.
  */
+
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE   /* O_DIRECT */
+#endif
 
 #include <errno.h>
 #include <signal.h>
@@ -197,23 +218,43 @@ static void print_effective_config(const RTXconfigInfo *cfg, const char *output_
         cfg->gain, cfg->gain_2);
 }
 
-static int write_full(FILE *fp, const void *buf, size_t len)
+/* Buffer/length/offset alignment used for O_DIRECT. 4096 is a multiple of the
+ * 512-byte logical sector of the usual 512e NVMe, so an aligned buffer / length
+ * here is always valid; it also covers 4Kn devices for the period writes (the
+ * only write that is not a multiple of 4096 is the 512-byte header, which the
+ * EINVAL fallback handles). */
+#define RX_DIRECT_ALIGN   4096u
+
+/* pwrite() the whole buffer at an explicit offset, looping over short writes
+ * and EINTR. Used for both the header (offset 0) and the IQ payload, so the
+ * file position is never relied upon. Under O_DIRECT every short write returns
+ * a block-aligned count, so the remaining (buf, len, off) stay aligned. */
+static int write_all_at(int fd, const void *buf, size_t len, off_t off)
 {
-    size_t done = 0;
     const uint8_t *p = buf;
 
-    while (done < len) {
-        size_t rc = fwrite(p + done, 1, len - done, fp);
-        if (rc == 0) {
-            if (ferror(fp) && errno == EINTR) {
-                clearerr(fp);
+    while (len > 0) {
+        ssize_t rc = pwrite(fd, p, len, off);
+        if (rc < 0) {
+            if (errno == EINTR)
                 continue;
-            }
             return -1;
         }
-        done += rc;
+        if (rc == 0)
+            return -1;
+        p   += rc;
+        off += rc;
+        len -= (size_t)rc;
     }
     return 0;
+}
+
+/* Write (or rewrite) the 512-byte header at file offset 0, through the
+ * page-aligned scratch buffer so the source is valid for O_DIRECT. */
+static int write_header_at(int fd, const RTXconfigInfo *cfg, void *hdr_buf)
+{
+    memcpy(hdr_buf, cfg, sizeof(*cfg));   /* sizeof == RTX_HEADER_BYTES (512) */
+    return write_all_at(fd, hdr_buf, RTX_HEADER_BYTES, 0);
 }
 
 int main(int argc, char **argv)
@@ -223,10 +264,14 @@ int main(int argc, char **argv)
     const char *device_path = DEFAULT_DEVICE;
     int nargs = argc - 1;
     int fd = -1;
-    FILE *out_fp = NULL;
+    int out_fd = -1;
+    int direct = 0;                 /* 1 while the output fd is O_DIRECT */
+    void *bounce = NULL;            /* page-aligned RAM staging for O_DIRECT */
+    void *hdr_buf = NULL;           /* page-aligned 512-byte header scratch */
     uint8_t *rx_ring = MAP_FAILED;
     struct t510_dma_v2_status status;
     size_t ring_bytes = 0;
+    off_t payload_off = RTX_HEADER_BYTES;   /* IQ starts right after the header */
     uint64_t local_count = 0;
     uint64_t bytes_written = 0;     /* IQ payload bytes (excludes 512 header) */
     uint64_t overrun_count = 0;
@@ -279,16 +324,40 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    /* Open with w+b: truncate/create, and allow seeking back to rewrite the
-     * 512-byte header at the end. */
-    out_fp = fopen(output_path, "w+b");
-    if (!out_fp) {
-        perror("fopen(output)");
-        munmap(rx_ring, ring_bytes);
-        close(fd);
-        return EXIT_FAILURE;
+    /* Page-aligned staging buffers for O_DIRECT: a header scratch (one block)
+     * and a bounce buffer big enough to coalesce a full ring's worth of
+     * completed periods into one write. Both are valid GUP-able RAM, unlike the
+     * dma_mmap_coherent rx_ring. */
+    if (posix_memalign(&hdr_buf, RX_DIRECT_ALIGN, RX_DIRECT_ALIGN) != 0 ||
+        posix_memalign(&bounce, RX_DIRECT_ALIGN, ring_bytes) != 0) {
+        fprintf(stderr, "rx_stream: failed to allocate aligned write buffers\n");
+        hdr_buf = NULL;   /* posix_memalign leaves the ptr undefined on failure */
+        bounce  = NULL;
+        goto fail;
     }
-    setvbuf(out_fp, NULL, _IOFBF, 1U << 20);
+
+    /* Open the capture file with O_DIRECT to bypass the page cache (see the
+     * file-header note). Fall back to a buffered open if the filesystem rejects
+     * O_DIRECT outright. O_TRUNC|O_CREAT replaces the old fopen("w+b"); the end-
+     * of-run header rewrite uses pwrite(offset 0) instead of fseek. */
+    {
+        int oflags = O_RDWR | O_CREAT | O_TRUNC;
+
+        out_fd = open(output_path, oflags | O_DIRECT, 0644);
+        if (out_fd >= 0) {
+            direct = 1;
+        } else {
+            out_fd = open(output_path, oflags, 0644);
+            if (out_fd >= 0)
+                fprintf(stderr,
+                    "rx_stream: O_DIRECT open failed (%s); using buffered writes\n",
+                    strerror(errno));
+        }
+        if (out_fd < 0) {
+            perror("open(output)");
+            goto fail;
+        }
+    }
 
     /* Lay down the 512-byte header before any IQ (payload_bytes filled in at
      * the end). */
@@ -298,16 +367,31 @@ int main(int argc, char **argv)
     cfg.payload_bytes    = 0;
     cfg.start_offset_sec = 0.0;   /* rx does not use these two */
     cfg.auto_replay      = 0;
-    if (rtx_write_header(out_fp, &cfg) != 0) {
-        perror("write(header)");
-        goto fail;
+    if (write_header_at(out_fd, &cfg, hdr_buf) != 0) {
+        /* The 512-byte header is the one sub-4K write; on a 4Kn device O_DIRECT
+         * rejects it with EINVAL. Demote that fd to buffered and retry once. */
+        if (direct && errno == EINVAL) {
+            fprintf(stderr,
+                "rx_stream: O_DIRECT needs >512B alignment on this device; "
+                "using buffered writes\n");
+            close(out_fd);
+            out_fd = open(output_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+            direct = 0;
+            if (out_fd < 0 || write_header_at(out_fd, &cfg, hdr_buf) != 0) {
+                perror("write(header)");
+                goto fail;
+            }
+        } else {
+            perror("write(header)");
+            goto fail;
+        }
     }
-    /* file position is now at RTX_HEADER_BYTES (512); IQ follows. */
 
     fprintf(stderr,
             "rx_stream: ring = %u periods x %u bytes (%zu bytes); 512-byte header "
-            "written; press Ctrl+C to stop\n",
-            status.num_periods, status.period_bytes, ring_bytes);
+            "written (%s); press Ctrl+C to stop\n",
+            status.num_periods, status.period_bytes, ring_bytes,
+            direct ? "O_DIRECT" : "buffered");
 
     t_start = now_monotonic();
 
@@ -353,22 +437,37 @@ int main(int argc, char **argv)
             local_count = hw_count - (status.num_periods - 1);
         }
 
-        /* Drain every newly completed period. The inner loop finishes the
-         * period it is currently writing before re-checking stopg, so SIGINT
-         * never truncates a period mid-write (no mid-block corruption). */
-        while (local_count < hw_count && !stopg) {
-            uint32_t idx = (uint32_t)(local_count % status.num_periods);
+        /* Drain every newly completed period in one shot: copy them out of the
+         * cyclic ring into the contiguous bounce buffer (at most two memcpys --
+         * one up to the ring end, one for the wrapped remainder), then issue a
+         * single write. After the overrun resync above, (hw_count-local_count)
+         * is always < num_periods, so the batch always fits in the bounce
+         * buffer (sized to a full ring). Only whole periods are ever copied, so
+         * a concurrent SIGINT/duration stop never truncates a period mid-write.
+         */
+        {
+            uint64_t batch = hw_count - local_count;
+            uint32_t idx   = (uint32_t)(local_count % status.num_periods);
+            uint64_t first  = status.num_periods - idx;   /* periods to ring end */
+            size_t   nbytes = (size_t)batch * status.period_bytes;
 
-            if (write_full(out_fp, rx_ring + (size_t)idx * status.period_bytes,
-                            status.period_bytes) != 0) {
-                perror("fwrite(output)");
+            if (first > batch)
+                first = batch;
+            memcpy(bounce,
+                   rx_ring + (size_t)idx * status.period_bytes,
+                   (size_t)first * status.period_bytes);
+            if (batch > first)
+                memcpy((uint8_t *)bounce + (size_t)first * status.period_bytes,
+                       rx_ring,
+                       (size_t)(batch - first) * status.period_bytes);
+
+            if (write_all_at(out_fd, bounce, nbytes, payload_off) != 0) {
+                perror("pwrite(output)");
                 goto fail;
             }
-            bytes_written += status.period_bytes;
-            local_count++;
-
-            if (duration_sec > 0.0 && (now_monotonic() - t_start) >= duration_sec)
-                break;
+            payload_off   += (off_t)nbytes;
+            bytes_written += nbytes;
+            local_count    = hw_count;
         }
     }
 
@@ -394,14 +493,19 @@ fail:
     }
 
     /* Update the header with the final IQ byte count (on normal completion,
-     * duration expiry, SIGINT, or error) so the file stays self-describing. */
-    if (out_fp) {
+     * duration expiry, SIGINT, or error) so the file stays self-describing.
+     * Rewriting offset 0 is one block, so it stays valid under O_DIRECT. */
+    if (out_fd >= 0) {
         cfg.payload_bytes = bytes_written;
-        if (rtx_write_header(out_fp, &cfg) != 0)
+        if (hdr_buf && write_header_at(out_fd, &cfg, hdr_buf) != 0)
             fprintf(stderr, "rx_stream: warning: failed to update header byte count\n");
-        fflush(out_fp);
-        fclose(out_fp);
+        if (fsync(out_fd) != 0)
+            fprintf(stderr, "rx_stream: warning: fsync failed: %s\n", strerror(errno));
+        close(out_fd);
     }
+
+    free(bounce);
+    free(hdr_buf);
 
     if (rx_ring != MAP_FAILED)
         munmap(rx_ring, ring_bytes);
