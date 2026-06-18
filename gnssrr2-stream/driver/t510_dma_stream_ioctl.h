@@ -54,7 +54,7 @@
  */
 
 #define T510_DMA_V2_PERIOD_BYTES   (1U * 1024U * 1024U)   /* 1 MiB, driver default */
-#define T510_DMA_V2_NUM_PERIODS    16U                     /* driver default */
+#define T510_DMA_V2_NUM_PERIODS    64U                     /* driver default */
 #define T510_DMA_V2_RING_BYTES \
     ((uint64_t)T510_DMA_V2_PERIOD_BYTES * (uint64_t)T510_DMA_V2_NUM_PERIODS)
 

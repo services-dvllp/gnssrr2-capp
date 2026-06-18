@@ -43,13 +43,37 @@
 #include <linux/wait.h>
 #include "t510_dma_stream_ioctl.h"
 
+/*
+ * Ring sizing. The cyclic ring is num_periods periods of period_bytes each, and
+ * BOTH an RX and a TX ring of this size are allocated from coherent (CMA-backed,
+ * low-memory) DMA memory at probe -- total = 2 * period_bytes * num_periods.
+ *
+ * The PL AXI DMA (systemJun17.dts dma@80040000) constrains the period SIZE, not
+ * the period count:
+ *   - xlnx,sg-length-width = 26  -> each period is one cyclic SG descriptor whose
+ *     length field is 26 bits, so period_bytes must be < 2^26 (~63.99 MiB). Keep
+ *     it at 1 MiB; do not approach 64 MiB.
+ *   - xlnx,addrwidth = 32        -> buffers must be 32-bit addressable; coherent
+ *     CMA is in the low memory bank (memory@0 0x0..0x7ff00000), which is fine.
+ * Growing the RING is therefore done via num_periods (descriptor COUNT, which the
+ * hardware does not cap), bounded only by how much coherent CMA is available.
+ * Allocation failure is handled cleanly (probe returns -ENOMEM, no /dev node), so
+ * an over-large num_periods fails safe: rmmod and reload with a smaller value.
+ *
+ * Default raised from 16 to 64 (64 MiB per ring, 128 MiB coherent total) to give
+ * the SSD writer more slack to ride out write-latency bursts. NOTE: a deeper ring
+ * only delays the first overrun by ring_bytes/(stream_rate - sustained_write_rate);
+ * it cannot compensate for a sustained write rate below the ~983 MB/s stream.
+ */
 static unsigned int period_bytes = T510_DMA_V2_PERIOD_BYTES;
 module_param(period_bytes, uint, 0444);
-MODULE_PARM_DESC(period_bytes, "Bytes per DMA period (must be a multiple of PAGE_SIZE)");
+MODULE_PARM_DESC(period_bytes,
+    "Bytes per DMA period (multiple of PAGE_SIZE; must be < 2^26 per sg-length-width=26)");
 
 static unsigned int num_periods = T510_DMA_V2_NUM_PERIODS;
 module_param(num_periods, uint, 0444);
-MODULE_PARM_DESC(num_periods, "Number of periods per ring (RX and TX each get their own ring)");
+MODULE_PARM_DESC(num_periods,
+    "Periods per ring (RX and TX each get one ring; total coherent = 2*period_bytes*num_periods, CMA-bound)");
 
 struct t510_dma_v2_dev {
     struct device *dev;
