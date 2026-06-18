@@ -78,7 +78,8 @@ only one may be loaded at a time:
 
 ```bash
 rmmod t510_dma_loopback 2>/dev/null
-insmod build/t510_dma_stream.ko           # optional: num_periods=32 period_bytes=1048576
+insmod build/t510_dma_stream.ko           # default: num_periods=64 period_bytes=1048576 (64 MiB/ring)
+                                          # override e.g.: insmod ... num_periods=128
 # /dev/t510_dma_stream now exists
 ```
 
@@ -223,6 +224,30 @@ bitstream instantiates all four tiles with MTS.
 - The continuous-streaming guarantee depends on sustained SSD throughput
   meeting the RFDC data rate (≈983 MB/s for the documented config). Shortfalls
   are detected and counted as overruns (RX) / underruns (TX), logged to stderr.
+  To close the gap, `rx_stream`: (1) writes with **O_DIRECT** (bounce-copying
+  each period out of the `dma_mmap_coherent` ring into a page-aligned buffer,
+  since coherent mappings cannot be pinned for O_DIRECT) to bypass page-cache
+  writeback throttling, and coalesces all newly completed periods into one
+  write per drain; (2) **pre-allocates** the whole output file for a
+  fixed-duration capture (`posix_fallocate`, header + `duration ×
+  983,040,000 B`, rounded up to a period; `ftruncate`d back to the real size on
+  exit) so the block allocator never stalls the hot path. O_DIRECT needs the IQ
+  payload offset (512) to be a multiple of the logical sector; on a 4Kn device
+  the 512-byte header write returns `EINVAL` and the writer falls back to
+  buffered I/O automatically.
+- **Ring sizing (`num_periods`).** Default is 64 periods × 1 MiB = 64 MiB per
+  ring; the RX and TX rings are both allocated, so coherent DMA use is
+  `2 × period_bytes × num_periods` (128 MiB at the default). This memory is
+  CMA-backed and 32-bit-addressable (PL AXI DMA `xlnx,addrwidth=32`,
+  `memory@0` low bank `0x0..0x7ff00000`). `period_bytes` must stay < 2²⁶
+  (~63.99 MiB) because each period is one cyclic SG descriptor and
+  `xlnx,sg-length-width=26`; grow the ring via `num_periods` (descriptor count,
+  uncapped by hardware), bounded only by available CMA. An over-large value
+  fails **safe** — probe returns `-ENOMEM`, no `/dev/t510_dma_stream` appears;
+  check `dmesg`, then `rmmod` and reload with a smaller `num_periods=`. A deeper
+  ring only buys `ring_bytes / (stream_rate − sustained_write_rate)` seconds of
+  burst slack; it does **not** raise sustained throughput, so it cannot by
+  itself make a long capture gap-free if the SSD writes slower than the stream.
 - Built and warning-checked with native gcc; **not yet validated on the T510
   board** (no board/aarch64 runtime in the build environment).
 ```

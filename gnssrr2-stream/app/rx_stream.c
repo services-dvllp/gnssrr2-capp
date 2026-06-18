@@ -65,6 +65,15 @@
 #define DEFAULT_OUTPUT_PATH  "rx_capture.bin"
 #define RX_NUM_POS_ARGS      13   /* full positional argument count */
 
+/*
+ * Verified DMA payload byte rate: the frame rate equals the per-channel complex
+ * sample rate (122.88 MSPS) and each frame is RTX_FRAME_BYTES (I0,Q0,I1,Q1 = 8 B).
+ * Source of truth: top-level README.md "Expected output size calculation"
+ * (983,040,000 B/s) and rtx_config.h (RTX_DEFAULT_FS_HZ, RTX_FRAME_BYTES). Used
+ * only to pre-size the output file for a fixed-duration capture.
+ */
+#define RX_STREAM_BYTES_PER_SEC  ((uint64_t)RTX_DEFAULT_FS_HZ * (uint64_t)RTX_FRAME_BYTES)
+
 /* Global stop flag (task-mandated name). Set from the signal handler; the
  * streaming loop polls it and exits only after the current period completes. */
 static volatile sig_atomic_t stopg;
@@ -393,6 +402,33 @@ int main(int argc, char **argv)
             status.num_periods, status.period_bytes, ring_bytes,
             direct ? "O_DIRECT" : "buffered");
 
+    /* Pre-allocate the whole output file up front for a fixed-duration capture
+     * (header + duration * 983,040,000 B/s, rounded up to a whole period). This
+     * reserves contiguous blocks so the SSD writer never pays the filesystem
+     * block-allocator / extent-conversion cost in the hot path, which otherwise
+     * stalls O_DIRECT writes and feeds back as ring overruns. posix_fallocate
+     * only reserves space (it does not erase or write the device) and is best-
+     * effort: a failure (e.g. unsupported filesystem) is non-fatal. The file is
+     * ftruncate()d back to the real byte count on exit. Duration 0 (until
+     * Ctrl+C) has no known size, so preallocation is skipped. */
+    if (duration_sec > 0.0) {
+        uint64_t want = (uint64_t)(duration_sec * (double)RX_STREAM_BYTES_PER_SEC);
+        uint64_t periods = (want + status.period_bytes - 1) / status.period_bytes;
+        off_t prealloc = (off_t)RTX_HEADER_BYTES + (off_t)(periods * status.period_bytes);
+        int rc = posix_fallocate(out_fd, 0, prealloc);
+
+        if (rc != 0) {
+            fprintf(stderr,
+                "rx_stream: warning: posix_fallocate(%lld bytes) failed (%s); "
+                "continuing without preallocation\n",
+                (long long)prealloc, strerror(rc));
+        } else {
+            fprintf(stderr, "rx_stream: pre-allocated %lld bytes (%.3f MB) for %.3fs\n",
+                    (long long)prealloc, (double)prealloc / (1024.0 * 1024.0),
+                    duration_sec);
+        }
+    }
+
     t_start = now_monotonic();
 
     if (ioctl(fd, T510_DMA_V2_IOC_START_RX) != 0) {
@@ -499,6 +535,11 @@ fail:
         cfg.payload_bytes = bytes_written;
         if (hdr_buf && write_header_at(out_fd, &cfg, hdr_buf) != 0)
             fprintf(stderr, "rx_stream: warning: failed to update header byte count\n");
+        /* Drop any preallocated-but-unwritten tail so the file size matches the
+         * data actually captured (overruns / early stop write less than the
+         * fixed-duration preallocation reserved). */
+        if (ftruncate(out_fd, (off_t)RTX_HEADER_BYTES + (off_t)bytes_written) != 0)
+            fprintf(stderr, "rx_stream: warning: ftruncate failed: %s\n", strerror(errno));
         if (fsync(out_fd) != 0)
             fprintf(stderr, "rx_stream: warning: fsync failed: %s\n", strerror(errno));
         close(out_fd);
