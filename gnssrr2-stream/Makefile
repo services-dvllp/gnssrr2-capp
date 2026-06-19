@@ -73,9 +73,13 @@ apps: fix-mtime $(BINS)
 	@echo "Built: $(BINS)"
 
 # --- link the three user-space binaries ---
+# rx_stream uses a producer/consumer thread pair (DMA->RAM, RAM->SSD), so it
+# compiles and links with -pthread; the other two binaries are single-threaded.
+$(OBJ)/app/rx_stream.o: CFLAGS += -pthread
+
 $(BUILD)/rx_stream: $(OBJ)/app/rx_stream.o $(RFDC_OBJS)
 	@mkdir -p $(@D)
-	$(CC) $^ $(LDLIBS) -o $@
+	$(CC) $^ $(LDLIBS) -pthread -o $@
 
 $(BUILD)/tx_stream: $(OBJ)/app/tx_stream.o $(RFDC_OBJS)
 	@mkdir -p $(@D)

@@ -33,6 +33,28 @@
  *      512e NVMe. On a 4Kn device the 512-byte header write returns EINVAL and
  *      the code transparently falls back to a buffered (page-cache) write.
  *
+ *   6. The capture path is split into two threads so the (slow) read out of the
+ *      non-cacheable DMA ring and the SSD write no longer run back-to-back in
+ *      one loop:
+ *
+ *         producer (DMA -> RAM): polls GET_STATUS/WAIT_RX, does the overrun
+ *             detect-and-resync, and memcpy's each batch of completed periods
+ *             out of the coherent ring into a free RAM staging buffer.
+ *         consumer (RAM -> SSD): pwrite()s each filled staging buffer to the
+ *             output file.
+ *
+ *      A small bounded pool of page-aligned staging buffers connects them
+ *      (mutex + two condvars). In the old single-threaded loop the per-batch
+ *      cost was memcpy_time + write_time *in series*, so the loop only kept up
+ *      with the DMA if that SUM stayed under the period interval; while a write
+ *      was in flight nothing drained the ring. Overlapping the two makes the
+ *      DMA-racing path cost max(memcpy, write) instead, and the SSD write no
+ *      longer blocks the ring drain. This does NOT speed the memcpy itself: if
+ *      the read out of the non-cacheable ring alone cannot sustain the stream
+ *      rate, overruns still occur (and are still detected/counted/ logged
+ *      identically). The on-disk format, CLI, overrun semantics and shutdown
+ *      behavior are unchanged; only the internal pipelining differs.
+ *
  * The RF parameters (LO/BW/Fs/ADC-bits/Gain, per channel) are accepted and
  * stored in the header for self-description only. They are NOT pushed into the
  * RFDC hardware: the vendored RFDC init (main_linux.c) hard-codes its NCO/rate/
@@ -46,6 +68,7 @@
 #endif
 
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -64,6 +87,18 @@
 #define DEFAULT_DEVICE       "/dev/t510_dma_stream"
 #define DEFAULT_OUTPUT_PATH  "rx_capture.bin"
 #define RX_NUM_POS_ARGS      13   /* full positional argument count */
+
+/*
+ * Number of RAM staging buffers shared by the producer/consumer pair. Each is
+ * sized to a full ring (the worst-case single drain after an overrun resync is
+ * num_periods-1 periods), so total extra RAM is RX_NUM_WRITE_BUFS * ring_bytes
+ * (e.g. 4 * 64 MiB = 256 MiB at the driver defaults). 2 is the minimum that
+ * allows the producer to fill one buffer while the consumer writes another;
+ * the extra slots give the consumer slack to ride out SSD write-latency bursts
+ * without stalling the ring drain. This is ordinary anonymous RAM, separate
+ * from the driver's coherent DMA rings.
+ */
+#define RX_NUM_WRITE_BUFS    4
 
 /*
  * Verified DMA payload byte rate: the frame rate equals the per-channel complex
@@ -266,6 +301,262 @@ static int write_header_at(int fd, const RTXconfigInfo *cfg, void *hdr_buf)
     return write_all_at(fd, hdr_buf, RTX_HEADER_BYTES, 0);
 }
 
+/* ------------------------------------------------------------------------- *
+ * Producer/consumer plumbing.
+ *
+ * cap_pipe is a bounded pool of page-aligned staging buffers handed back and
+ * forth between the two threads. Empty buffers sit on a free stack; the
+ * producer pops one, fills it (memcpy out of the coherent ring), and pushes it
+ * onto the filled FIFO; the consumer pops the filled FIFO, writes it, and
+ * pushes it back onto the free stack. One mutex guards all queue state; two
+ * condvars signal "a buffer became free" and "a buffer became filled".
+ * ------------------------------------------------------------------------- */
+struct cap_buf {
+    void  *base;   /* page-aligned, buf_bytes capacity                       */
+    size_t len;    /* valid bytes the consumer must write (set by producer)  */
+};
+
+struct cap_pipe {
+    pthread_mutex_t mtx;
+    pthread_cond_t  can_produce;   /* a buffer returned to the free stack    */
+    pthread_cond_t  can_consume;   /* a buffer was pushed to the filled FIFO */
+
+    int            nbufs;
+    struct cap_buf bufs[RX_NUM_WRITE_BUFS];
+
+    int free_idx[RX_NUM_WRITE_BUFS];  /* stack of free buffer indices         */
+    int free_top;                     /* number of entries in free_idx[]      */
+
+    int filled[RX_NUM_WRITE_BUFS];    /* FIFO of filled buffer indices        */
+    int f_head, f_tail, f_count;
+
+    int producer_done;   /* producer will push no more buffers               */
+    int abort;           /* fatal writer error: tear everything down         */
+};
+
+/* Allocate nbufs page-aligned staging buffers of buf_bytes each and init the
+ * queue state. Returns 0 on success, -1 on allocation failure (partial allocs
+ * are freed). On success cap_pipe_destroy() must be called to release them. */
+static int cap_pipe_init(struct cap_pipe *pipe, int nbufs, size_t buf_bytes)
+{
+    int i;
+
+    memset(pipe, 0, sizeof(*pipe));
+    pthread_mutex_init(&pipe->mtx, NULL);
+    pthread_cond_init(&pipe->can_produce, NULL);
+    pthread_cond_init(&pipe->can_consume, NULL);
+
+    pipe->nbufs = nbufs;
+    for (i = 0; i < nbufs; i++) {
+        if (posix_memalign(&pipe->bufs[i].base, RX_DIRECT_ALIGN, buf_bytes) != 0) {
+            pipe->bufs[i].base = NULL;   /* undefined on failure */
+            while (--i >= 0) {
+                free(pipe->bufs[i].base);
+                pipe->bufs[i].base = NULL;
+            }
+            pthread_mutex_destroy(&pipe->mtx);
+            pthread_cond_destroy(&pipe->can_produce);
+            pthread_cond_destroy(&pipe->can_consume);
+            return -1;
+        }
+        pipe->free_idx[i] = i;   /* every buffer starts free */
+    }
+    pipe->free_top = nbufs;
+    return 0;
+}
+
+static void cap_pipe_destroy(struct cap_pipe *pipe)
+{
+    int i;
+
+    for (i = 0; i < pipe->nbufs; i++)
+        free(pipe->bufs[i].base);
+    pthread_mutex_destroy(&pipe->mtx);
+    pthread_cond_destroy(&pipe->can_produce);
+    pthread_cond_destroy(&pipe->can_consume);
+}
+
+/* Producer thread: DMA ring -> RAM. Mirrors the original single-threaded drain
+ * loop exactly (GET_STATUS / WAIT_RX / overrun detect-and-resync / period
+ * copy-out); the only difference is that the copied batch is handed to the
+ * consumer instead of being written here. */
+struct producer_args {
+    int             fd;
+    const uint8_t  *rx_ring;
+    double          duration_sec;
+    double          t_start;
+    struct cap_pipe *pipe;
+
+    /* outputs, read by main after join */
+    uint64_t        local_count;     /* periods copied out of the ring        */
+    uint64_t        overrun_count;
+    int             failed;          /* non-signal ioctl error                */
+};
+
+static void *producer_thread(void *arg)
+{
+    struct producer_args *p = arg;
+    struct cap_pipe *pipe = p->pipe;
+    struct t510_dma_v2_status status;
+
+    while (!stopg) {
+        uint64_t hw_count;
+        uint64_t since;
+
+        if (p->duration_sec > 0.0 && (now_monotonic() - p->t_start) >= p->duration_sec)
+            break;
+
+        if (ioctl(p->fd, T510_DMA_V2_IOC_GET_STATUS, &status) != 0) {
+            perror("ioctl(get_status)");
+            p->failed = 1;
+            break;
+        }
+        hw_count = status.rx_hw_periods;
+
+        if (hw_count == p->local_count) {
+            /* Nothing new yet: block until the next period completes. */
+            since = p->local_count;
+            if (ioctl(p->fd, T510_DMA_V2_IOC_WAIT_RX, &since) != 0) {
+                perror("ioctl(wait_rx)");
+                p->failed = 1;
+                break;
+            }
+            continue;
+        }
+
+        if (hw_count - p->local_count >= status.num_periods) {
+            /* Fell behind by a full ring: oldest unread period(s) overwritten.
+             * Resync to the oldest period guaranteed complete and not being
+             * written right now: hw_count - (num_periods - 1). */
+            uint64_t lost = (hw_count - p->local_count) - (status.num_periods - 1);
+
+            fprintf(stderr,
+                    "rx_stream: overrun, lost %llu period(s) (total overruns=%llu)\n",
+                    (unsigned long long)lost,
+                    (unsigned long long)(p->overrun_count + lost));
+            p->overrun_count += lost;
+            p->local_count = hw_count - (status.num_periods - 1);
+        }
+
+        /* Drain every newly completed period in one shot: copy them out of the
+         * cyclic ring into a free contiguous staging buffer (at most two
+         * memcpys -- one up to the ring end, one for the wrapped remainder),
+         * then hand it to the consumer to write. After the overrun resync
+         * above, (hw_count-local_count) is always < num_periods, so the batch
+         * always fits in one staging buffer (sized to a full ring). Only whole
+         * periods are ever copied, so a concurrent SIGINT/duration stop never
+         * truncates a period mid-write. */
+        {
+            uint64_t batch  = hw_count - p->local_count;
+            uint32_t idx    = (uint32_t)(p->local_count % status.num_periods);
+            uint64_t first  = status.num_periods - idx;   /* periods to ring end */
+            size_t   nbytes = (size_t)batch * status.period_bytes;
+            int      bi;
+
+            if (first > batch)
+                first = batch;
+
+            /* Acquire a free staging buffer (blocks if the consumer is behind;
+             * that back-pressure lets the ring fill and is what an overrun is
+             * recovered from on the next iteration -- exactly as before). */
+            pthread_mutex_lock(&pipe->mtx);
+            while (pipe->free_top == 0 && !pipe->abort)
+                pthread_cond_wait(&pipe->can_produce, &pipe->mtx);
+            if (pipe->abort) {
+                pthread_mutex_unlock(&pipe->mtx);
+                p->failed = 1;
+                break;
+            }
+            bi = pipe->free_idx[--pipe->free_top];
+            pthread_mutex_unlock(&pipe->mtx);
+
+            memcpy(pipe->bufs[bi].base,
+                   p->rx_ring + (size_t)idx * status.period_bytes,
+                   (size_t)first * status.period_bytes);
+            if (batch > first)
+                memcpy((uint8_t *)pipe->bufs[bi].base + (size_t)first * status.period_bytes,
+                       p->rx_ring,
+                       (size_t)(batch - first) * status.period_bytes);
+            pipe->bufs[bi].len = nbytes;
+
+            pthread_mutex_lock(&pipe->mtx);
+            pipe->filled[pipe->f_tail] = bi;
+            pipe->f_tail = (pipe->f_tail + 1) % pipe->nbufs;
+            pipe->f_count++;
+            pthread_cond_signal(&pipe->can_consume);
+            pthread_mutex_unlock(&pipe->mtx);
+
+            p->local_count = hw_count;
+        }
+    }
+
+    /* Tell the consumer no more buffers are coming so it drains what is queued
+     * and exits. */
+    pthread_mutex_lock(&pipe->mtx);
+    pipe->producer_done = 1;
+    pthread_cond_broadcast(&pipe->can_consume);
+    pthread_mutex_unlock(&pipe->mtx);
+    return NULL;
+}
+
+/* Consumer thread: RAM -> SSD. Writes each filled staging buffer at the running
+ * payload offset. The producer owns local_count/overruns; the consumer owns the
+ * file offset and the IQ byte count, so the two never touch the same field. */
+struct consumer_args {
+    int             out_fd;
+    off_t           payload_off;     /* starts at RTX_HEADER_BYTES            */
+    struct cap_pipe *pipe;
+
+    /* outputs, read by main after join */
+    uint64_t        bytes_written;   /* IQ payload bytes actually written     */
+    int             failed;          /* pwrite() error                        */
+};
+
+static void *consumer_thread(void *arg)
+{
+    struct consumer_args *c = arg;
+    struct cap_pipe *pipe = c->pipe;
+
+    for (;;) {
+        int    bi;
+        size_t len;
+
+        pthread_mutex_lock(&pipe->mtx);
+        while (pipe->f_count == 0 && !pipe->producer_done && !pipe->abort)
+            pthread_cond_wait(&pipe->can_consume, &pipe->mtx);
+        if (pipe->f_count == 0) {
+            /* Drained, and the producer is finished (or we are aborting). */
+            pthread_mutex_unlock(&pipe->mtx);
+            break;
+        }
+        bi = pipe->filled[pipe->f_head];
+        pipe->f_head = (pipe->f_head + 1) % pipe->nbufs;
+        pipe->f_count--;
+        pthread_mutex_unlock(&pipe->mtx);
+
+        len = pipe->bufs[bi].len;
+        if (write_all_at(c->out_fd, pipe->bufs[bi].base, len, c->payload_off) != 0) {
+            perror("pwrite(output)");
+            c->failed = 1;
+            pthread_mutex_lock(&pipe->mtx);
+            pipe->abort = 1;
+            pthread_cond_broadcast(&pipe->can_produce);
+            pthread_cond_broadcast(&pipe->can_consume);
+            pthread_mutex_unlock(&pipe->mtx);
+            break;
+        }
+        c->payload_off   += (off_t)len;
+        c->bytes_written += len;
+
+        /* Return the buffer to the free stack for the producer to reuse. */
+        pthread_mutex_lock(&pipe->mtx);
+        pipe->free_idx[pipe->free_top++] = bi;
+        pthread_cond_signal(&pipe->can_produce);
+        pthread_mutex_unlock(&pipe->mtx);
+    }
+    return NULL;
+}
+
 int main(int argc, char **argv)
 {
     RTXconfigInfo cfg;
@@ -275,7 +566,6 @@ int main(int argc, char **argv)
     int fd = -1;
     int out_fd = -1;
     int direct = 0;                 /* 1 while the output fd is O_DIRECT */
-    void *bounce = NULL;            /* page-aligned RAM staging for O_DIRECT */
     void *hdr_buf = NULL;           /* page-aligned 512-byte header scratch */
     uint8_t *rx_ring = MAP_FAILED;
     struct t510_dma_v2_status status;
@@ -287,6 +577,13 @@ int main(int argc, char **argv)
     double duration_sec;
     double t_start = 0.0;
     int finished_ok = 0;
+
+    struct cap_pipe pipe;
+    int pipe_inited = 0;
+    pthread_t producer_tid, consumer_tid;
+    int producer_started = 0, consumer_started = 0;
+    struct producer_args pargs;
+    struct consumer_args cargs;
 
     if (argc >= 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
         usage(argv[0]);
@@ -333,17 +630,21 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    /* Page-aligned staging buffers for O_DIRECT: a header scratch (one block)
-     * and a bounce buffer big enough to coalesce a full ring's worth of
-     * completed periods into one write. Both are valid GUP-able RAM, unlike the
-     * dma_mmap_coherent rx_ring. */
-    if (posix_memalign(&hdr_buf, RX_DIRECT_ALIGN, RX_DIRECT_ALIGN) != 0 ||
-        posix_memalign(&bounce, RX_DIRECT_ALIGN, ring_bytes) != 0) {
-        fprintf(stderr, "rx_stream: failed to allocate aligned write buffers\n");
+    /* Page-aligned staging for O_DIRECT: a header scratch (one block) and a
+     * pool of bounce buffers big enough to coalesce a full ring's worth of
+     * completed periods into one write each. All are valid GUP-able RAM, unlike
+     * the dma_mmap_coherent rx_ring. */
+    if (posix_memalign(&hdr_buf, RX_DIRECT_ALIGN, RX_DIRECT_ALIGN) != 0) {
+        fprintf(stderr, "rx_stream: failed to allocate aligned header buffer\n");
         hdr_buf = NULL;   /* posix_memalign leaves the ptr undefined on failure */
-        bounce  = NULL;
         goto fail;
     }
+    if (cap_pipe_init(&pipe, RX_NUM_WRITE_BUFS, ring_bytes) != 0) {
+        fprintf(stderr, "rx_stream: failed to allocate %d aligned staging buffers\n",
+                RX_NUM_WRITE_BUFS);
+        goto fail;
+    }
+    pipe_inited = 1;
 
     /* Open the capture file with O_DIRECT to bypass the page cache (see the
      * file-header note). Fall back to a buffered open if the filesystem rejects
@@ -436,80 +737,66 @@ int main(int argc, char **argv)
         goto fail;
     }
 
-    while (!stopg) {
-        uint64_t hw_count;
-        uint64_t since;
+    /* Spawn the consumer (RAM -> SSD) first, then the producer (DMA -> RAM).
+     * The producer races the DMA ring; the consumer drains the staging pool to
+     * the SSD in parallel, so the SSD write latency is off the ring-drain path. */
+    memset(&cargs, 0, sizeof(cargs));
+    cargs.out_fd      = out_fd;
+    cargs.payload_off = payload_off;
+    cargs.pipe        = &pipe;
 
-        if (duration_sec > 0.0 && (now_monotonic() - t_start) >= duration_sec)
-            break;
+    memset(&pargs, 0, sizeof(pargs));
+    pargs.fd           = fd;
+    pargs.rx_ring      = rx_ring;
+    pargs.duration_sec = duration_sec;
+    pargs.t_start      = t_start;
+    pargs.pipe         = &pipe;
 
-        if (ioctl(fd, T510_DMA_V2_IOC_GET_STATUS, &status) != 0) {
-            perror("ioctl(get_status)");
-            goto fail;
-        }
-        hw_count = status.rx_hw_periods;
-
-        if (hw_count == local_count) {
-            /* Nothing new yet: block until the next period completes. */
-            since = local_count;
-            if (ioctl(fd, T510_DMA_V2_IOC_WAIT_RX, &since) != 0) {
-                perror("ioctl(wait_rx)");
-                goto fail;
-            }
-            continue;
-        }
-
-        if (hw_count - local_count >= status.num_periods) {
-            /* Fell behind by a full ring: oldest unread period(s) overwritten.
-             * Resync to the oldest period guaranteed complete and not being
-             * written right now: hw_count - (num_periods - 1). */
-            uint64_t lost = (hw_count - local_count) - (status.num_periods - 1);
-
-            fprintf(stderr,
-                    "rx_stream: overrun, lost %llu period(s) (total overruns=%llu)\n",
-                    (unsigned long long)lost,
-                    (unsigned long long)(overrun_count + lost));
-            overrun_count += lost;
-            local_count = hw_count - (status.num_periods - 1);
-        }
-
-        /* Drain every newly completed period in one shot: copy them out of the
-         * cyclic ring into the contiguous bounce buffer (at most two memcpys --
-         * one up to the ring end, one for the wrapped remainder), then issue a
-         * single write. After the overrun resync above, (hw_count-local_count)
-         * is always < num_periods, so the batch always fits in the bounce
-         * buffer (sized to a full ring). Only whole periods are ever copied, so
-         * a concurrent SIGINT/duration stop never truncates a period mid-write.
-         */
-        {
-            uint64_t batch = hw_count - local_count;
-            uint32_t idx   = (uint32_t)(local_count % status.num_periods);
-            uint64_t first  = status.num_periods - idx;   /* periods to ring end */
-            size_t   nbytes = (size_t)batch * status.period_bytes;
-
-            if (first > batch)
-                first = batch;
-            memcpy(bounce,
-                   rx_ring + (size_t)idx * status.period_bytes,
-                   (size_t)first * status.period_bytes);
-            if (batch > first)
-                memcpy((uint8_t *)bounce + (size_t)first * status.period_bytes,
-                       rx_ring,
-                       (size_t)(batch - first) * status.period_bytes);
-
-            if (write_all_at(out_fd, bounce, nbytes, payload_off) != 0) {
-                perror("pwrite(output)");
-                goto fail;
-            }
-            payload_off   += (off_t)nbytes;
-            bytes_written += nbytes;
-            local_count    = hw_count;
-        }
+    if (pthread_create(&consumer_tid, NULL, consumer_thread, &cargs) != 0) {
+        perror("pthread_create(consumer)");
+        goto fail;
     }
+    consumer_started = 1;
 
-    finished_ok = 1;
+    if (pthread_create(&producer_tid, NULL, producer_thread, &pargs) != 0) {
+        perror("pthread_create(producer)");
+        /* Release the consumer cleanly: it is blocked on can_consume. */
+        pthread_mutex_lock(&pipe.mtx);
+        pipe.producer_done = 1;
+        pipe.abort = 1;
+        pthread_cond_broadcast(&pipe.can_consume);
+        pthread_mutex_unlock(&pipe.mtx);
+        goto fail;
+    }
+    producer_started = 1;
+
+    /* Producer ends on stopg / duration / ioctl error and marks producer_done;
+     * the consumer then drains the remaining staging buffers and ends. */
+    pthread_join(producer_tid, NULL);
+    producer_started = 0;
+    pthread_join(consumer_tid, NULL);
+    consumer_started = 0;
+
+    local_count   = pargs.local_count;
+    overrun_count = pargs.overrun_count;
+    bytes_written = cargs.bytes_written;
+    finished_ok   = (!pargs.failed && !cargs.failed);
 
 fail:
+    /* If we jumped here with threads still running (e.g. consumer spawned but
+     * producer_create failed), join them before touching shared buffers. */
+    if (producer_started) {
+        pthread_join(producer_tid, NULL);
+        producer_started = 0;
+        local_count   = pargs.local_count;
+        overrun_count = pargs.overrun_count;
+    }
+    if (consumer_started) {
+        pthread_join(consumer_tid, NULL);
+        consumer_started = 0;
+        bytes_written = cargs.bytes_written;
+    }
+
     if (fd >= 0)
         ioctl(fd, T510_DMA_V2_IOC_STOP_RX);
 
@@ -545,7 +832,8 @@ fail:
         close(out_fd);
     }
 
-    free(bounce);
+    if (pipe_inited)
+        cap_pipe_destroy(&pipe);
     free(hdr_buf);
 
     if (rx_ring != MAP_FAILED)
