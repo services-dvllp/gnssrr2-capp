@@ -67,6 +67,29 @@ struct t510_dma_v2_status {
     uint64_t tx_hw_periods;  /* periods fully played by TX DMA since START_TX */
 };
 
+/*
+ * Argument for T510_DMA_V2_IOC_SYNC_RX.
+ *
+ * The RX ring is allocated CACHEABLE (dma_alloc_noncoherent) so the CPU can
+ * drain it with a fast cache-line-filling memcpy instead of the ~5x slower
+ * uncached reads a coherent (Normal Non-Cacheable) mapping forces. Because the
+ * PL AXI DMA is not cache-coherent with the CPU, the driver must invalidate the
+ * CPU's caches for the just-completed periods BEFORE user space reads them, so
+ * the read sees the bytes the DMA wrote to DRAM rather than stale cache lines.
+ *
+ * User space calls SYNC_RX with the ring-slot index of the first completed
+ * period (local_count % num_periods) and the number of contiguous periods to
+ * invalidate; the driver splits the request at the ring wrap. period_start must
+ * be < num_periods and period_count must be <= num_periods (a single drain after
+ * the overrun resync is always < num_periods periods). period_count == 0 is a
+ * no-op. On a driver built for an older kernel without the cacheable path this
+ * ioctl is a harmless no-op (the ring is coherent and needs no sync).
+ */
+struct t510_dma_v2_sync {
+    uint64_t period_start;   /* ring-slot index of first period to invalidate */
+    uint64_t period_count;   /* number of contiguous periods                  */
+};
+
 #define T510_DMA_V2_IOC_MAGIC      'Q'
 #define T510_DMA_V2_IOC_START_RX   _IO(T510_DMA_V2_IOC_MAGIC, 1)
 #define T510_DMA_V2_IOC_STOP_RX    _IO(T510_DMA_V2_IOC_MAGIC, 2)
@@ -77,5 +100,8 @@ struct t510_dma_v2_status {
  * (or rx/tx is no longer running, or ~1s elapses with no change). */
 #define T510_DMA_V2_IOC_WAIT_RX    _IOWR(T510_DMA_V2_IOC_MAGIC, 6, uint64_t)
 #define T510_DMA_V2_IOC_WAIT_TX    _IOWR(T510_DMA_V2_IOC_MAGIC, 7, uint64_t)
+/* in: invalidate the CPU caches for a range of completed RX periods so a
+ * subsequent read of the cacheable RX ring sees freshly DMA'd data. */
+#define T510_DMA_V2_IOC_SYNC_RX    _IOW(T510_DMA_V2_IOC_MAGIC, 8, struct t510_dma_v2_sync)
 
 #endif /* T510_DMA_STREAM_IOCTL_H */

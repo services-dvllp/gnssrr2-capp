@@ -224,32 +224,40 @@ bitstream instantiates all four tiles with MTS.
 - The continuous-streaming guarantee depends on sustained SSD throughput
   meeting the RFDC data rate (≈983 MB/s for the documented config). Shortfalls
   are detected and counted as overruns (RX) / underruns (TX), logged to stderr.
-  To close the gap, `rx_stream`: (1) writes with **O_DIRECT** (bounce-copying
-  each period out of the `dma_mmap_coherent` ring into a page-aligned buffer,
-  since coherent mappings cannot be pinned for O_DIRECT) to bypass page-cache
-  writeback throttling, and coalesces all newly completed periods into one
-  write per drain; (2) **pre-allocates** the whole output file for a
-  fixed-duration capture (`posix_fallocate`, header + `duration ×
-  983,040,000 B`, rounded up to a period; `ftruncate`d back to the real size on
-  exit) so the block allocator never stalls the hot path. O_DIRECT needs the IQ
-  payload offset (512) to be a multiple of the logical sector; on a 4Kn device
-  the 512-byte header write returns `EINVAL` and the writer falls back to
-  buffered I/O automatically; (3) runs a **two-thread pipeline** — a *producer*
-  (DMA→RAM: GET_STATUS/WAIT_RX, overrun resync, memcpy of each completed batch
-  out of the non-cacheable coherent ring into a free RAM staging buffer) and a
-  *consumer* (RAM→SSD: `pwrite` of each filled buffer), joined by a small
-  bounded pool of `RX_NUM_WRITE_BUFS` page-aligned buffers (mutex + two
-  condvars). Overlapping the slow uncached read with the SSD write makes the
-  DMA-racing path cost `max(memcpy, write)` instead of their sum, and keeps the
-  ring draining while a write is in flight. This does **not** speed the uncached
-  memcpy itself: if the read out of the coherent ring alone cannot sustain
-  ≈983 MB/s, overruns still occur (and are detected/counted/logged identically).
-  The on-disk format, CLI, overrun semantics and shutdown behaviour are
-  unchanged.
+  To close the gap, `rx_stream` + the driver: (1) allocate the RX ring
+  **cacheable** (`dma_alloc_noncoherent`) and map it cacheable to user space, so
+  the ring→RAM drain is a normal cache-line-filling memcpy at multi-GB/s instead
+  of the ~136 MB/s an uncached coherent (`dma_mmap_coherent`, Normal
+  Non-Cacheable) mapping forced. Because the PL AXI DMA is not coherent with the
+  CPU caches, the producer invalidates each completed batch via the new
+  `T510_DMA_V2_IOC_SYNC_RX` ioctl (`dma_sync_single_for_cpu`) immediately before
+  reading it, and the driver flushes the ring once at `START_RX`. This was the
+  decisive bottleneck: the uncached read alone could not sustain the ≈983 MB/s
+  stream, so the ring overran regardless of the SSD or the pipeline. (On kernels
+  older than 5.10 the driver keeps the original coherent ring and `SYNC_RX` is a
+  no-op.) `rx_stream` also: (2) writes with **O_DIRECT** (bounce-copying each
+  period out of the `VM_PFNMAP` ring into a page-aligned buffer, since that
+  mapping cannot be pinned for O_DIRECT) to bypass page-cache writeback
+  throttling, and coalesces all newly completed periods into one write per drain;
+  (3) **pre-allocates** the whole output file for a fixed-duration capture
+  (`posix_fallocate`, header + `duration × 983,040,000 B`, rounded up to a
+  period; `ftruncate`d back to the real size on exit) so the block allocator
+  never stalls the hot path. O_DIRECT needs the IQ payload offset (512) to be a
+  multiple of the logical sector; on a 4Kn device the 512-byte header write
+  returns `EINVAL` and the writer falls back to buffered I/O automatically;
+  (4) runs a **two-thread pipeline** — a *producer* (DMA→RAM: GET_STATUS/WAIT_RX,
+  overrun resync, SYNC_RX, memcpy of each completed batch into a free RAM staging
+  buffer) and a *consumer* (RAM→SSD: `pwrite` of each filled buffer), joined by a
+  small bounded pool of `RX_NUM_WRITE_BUFS` page-aligned buffers (mutex + two
+  condvars). Overlapping the ring read with the SSD write makes the DMA-racing
+  path cost `max(memcpy, write)` instead of their sum, and keeps the ring
+  draining while a write is in flight. The on-disk format, CLI, overrun semantics
+  and shutdown behaviour are unchanged.
 - **Ring sizing (`num_periods`).** Default is 64 periods × 1 MiB = 64 MiB per
-  ring; the RX and TX rings are both allocated, so coherent DMA use is
-  `2 × period_bytes × num_periods` (128 MiB at the default). This memory is
-  CMA-backed and 32-bit-addressable (PL AXI DMA `xlnx,addrwidth=32`,
+  ring; the RX and TX rings are both allocated, so DMA memory use is
+  `2 × period_bytes × num_periods` (128 MiB at the default — RX cacheable, TX
+  coherent). This memory is CMA-backed and 32-bit-addressable (PL AXI DMA
+  `xlnx,addrwidth=32`,
   `memory@0` low bank `0x0..0x7ff00000`). `period_bytes` must stay < 2²⁶
   (~63.99 MiB) because each period is one cyclic SG descriptor and
   `xlnx,sg-length-width=26`; grow the ring via `num_periods` (descriptor count,

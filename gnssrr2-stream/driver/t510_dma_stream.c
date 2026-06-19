@@ -40,13 +40,39 @@
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+#include <linux/version.h>
 #include <linux/wait.h>
 #include "t510_dma_stream_ioctl.h"
 
 /*
+ * RX ring memory type.
+ *
+ * The original driver allocated the RX ring with dma_alloc_coherent(), which on
+ * ARM/ARM64 returns Normal Non-Cacheable memory. Draining that ring from the CPU
+ * (the memcpy in rx_stream's producer) is then limited to uncached read speed
+ * (~136 MB/s measured on the T510), far below the ~983 MB/s RFDC stream, so the
+ * ring overruns. Allocating the ring CACHEABLE instead (dma_alloc_noncoherent)
+ * lets the CPU drain it with a normal cache-line-filling copy at multi-GB/s; the
+ * cost is that the driver must explicitly invalidate the CPU caches for each
+ * completed period before user space reads it (the PL AXI DMA is not coherent
+ * with the CPU caches). That invalidation is what T510_DMA_V2_IOC_SYNC_RX does.
+ *
+ * dma_alloc_noncoherent()/dma_free_noncoherent() and the dma_sync_single_*
+ * pairing in their current form date to Linux 5.10. On older kernels we keep the
+ * original coherent allocation (correct, just slow); SYNC_RX becomes a no-op.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+#define T510_RX_CACHEABLE 1
+#else
+#define T510_RX_CACHEABLE 0
+#endif
+
+/*
  * Ring sizing. The cyclic ring is num_periods periods of period_bytes each, and
- * BOTH an RX and a TX ring of this size are allocated from coherent (CMA-backed,
- * low-memory) DMA memory at probe -- total = 2 * period_bytes * num_periods.
+ * an RX and a TX ring of this size are allocated from CMA-backed, low-memory DMA
+ * memory at probe -- total = 2 * period_bytes * num_periods. The RX ring is
+ * cacheable (dma_alloc_noncoherent; see T510_RX_CACHEABLE) so the CPU can drain
+ * it fast; the TX ring stays coherent (dma_alloc_coherent).
  *
  * The PL AXI DMA (systemJun17.dts dma@80040000) constrains the period SIZE, not
  * the period count:
@@ -190,6 +216,13 @@ static int t510_dma_v2_start_rx_locked(struct t510_dma_v2_dev *tdev)
     }
 
     memset(tdev->rx_buf, 0, tdev->ring_bytes);
+#if T510_RX_CACHEABLE
+    /* The memset dirtied the cacheable RX ring. Hand the whole ring back to the
+     * device (invalidate/clean) so no dirty line can later evict on top of data
+     * the DMA writes. From here SYNC_RX owns per-period CPU access. */
+    dma_sync_single_for_device(tdev->dev, tdev->rx_dma_addr, tdev->ring_bytes,
+                               DMA_FROM_DEVICE);
+#endif
     atomic64_set(&tdev->rx_hw_periods, 0);
 
     desc = dmaengine_prep_dma_cyclic(tdev->rx_chan, tdev->rx_dma_addr,
@@ -322,8 +355,20 @@ static int t510_dma_v2_mmap(struct file *file, struct vm_area_struct *vma)
     if (size == 0 || size > tdev->ring_bytes)
         return -EINVAL;
 
-    if (offset == 0)
+    if (offset == 0) {
+#if T510_RX_CACHEABLE
+        /* Map the cacheable RX ring write-back to user space (leave the vma's
+         * default cacheable prot; do NOT mark it non-cached). The ring is one
+         * physically contiguous allocation, so a single remap_pfn_range over its
+         * pages covers it. SYNC_RX keeps these user pages coherent with the DMA
+         * by invalidating the shared physical cache lines before each read. */
+        unsigned long pfn = page_to_pfn(virt_to_page(tdev->rx_buf));
+
+        return remap_pfn_range(vma, vma->vm_start, pfn, size, vma->vm_page_prot);
+#else
         return dma_mmap_coherent(tdev->dev, vma, tdev->rx_buf, tdev->rx_dma_addr, tdev->ring_bytes);
+#endif
+    }
 
     if (offset == tdev->ring_bytes) {
         vma->vm_pgoff = 0;
@@ -418,6 +463,42 @@ static long t510_dma_v2_ioctl(struct file *file, unsigned int cmd, unsigned long
         return 0;
     }
 
+    case T510_DMA_V2_IOC_SYNC_RX: {
+#if T510_RX_CACHEABLE
+        struct t510_dma_v2_sync s;
+        u64 slot, count, first;
+
+        if (copy_from_user(&s, (void __user *)arg, sizeof(s)))
+            return -EFAULT;
+
+        slot  = s.period_start;
+        count = s.period_count;
+        if (count == 0)
+            return 0;
+        if (slot >= tdev->num_periods || count > tdev->num_periods)
+            return -EINVAL;
+
+        /* Invalidate the CPU caches for the completed periods so the next read
+         * sees the DMA-written bytes. Split at the ring wrap, mirroring the
+         * two-memcpy drain in user space. */
+        first = (u64)tdev->num_periods - slot;
+        if (first > count)
+            first = count;
+
+        dma_sync_single_for_cpu(tdev->dev,
+                                tdev->rx_dma_addr + slot * tdev->period_bytes,
+                                first * tdev->period_bytes, DMA_FROM_DEVICE);
+        if (count > first)
+            dma_sync_single_for_cpu(tdev->dev, tdev->rx_dma_addr,
+                                    (count - first) * tdev->period_bytes,
+                                    DMA_FROM_DEVICE);
+        return 0;
+#else
+        /* Coherent RX ring: nothing to sync. */
+        return 0;
+#endif
+    }
+
     default:
         return -ENOTTY;
     }
@@ -463,8 +544,20 @@ static int t510_dma_v2_probe(struct platform_device *pdev)
     tdev->num_periods = num_periods;
     tdev->ring_bytes = (size_t)period_bytes * (size_t)num_periods;
 
+    /*
+     * RX ring: cacheable (dma_alloc_noncoherent) so the CPU drain memcpy runs at
+     * cache speed; coherency is handled explicitly via SYNC_RX + the START_RX
+     * flush. dma_alloc_noncoherent has no devm_ variant, so this one ring is
+     * freed by hand (err_free_rx / remove); TX stays managed-coherent.
+     */
+#if T510_RX_CACHEABLE
+    tdev->rx_buf = dma_alloc_noncoherent(&pdev->dev, tdev->ring_bytes,
+                                          &tdev->rx_dma_addr, DMA_FROM_DEVICE,
+                                          GFP_KERNEL);
+#else
     tdev->rx_buf = dmam_alloc_coherent(&pdev->dev, tdev->ring_bytes,
                                         &tdev->rx_dma_addr, GFP_KERNEL);
+#endif
     if (!tdev->rx_buf) {
         dev_err(&pdev->dev, "failed to allocate %zu-byte RX ring\n", tdev->ring_bytes);
         return -ENOMEM;
@@ -474,7 +567,8 @@ static int t510_dma_v2_probe(struct platform_device *pdev)
                                         &tdev->tx_dma_addr, GFP_KERNEL);
     if (!tdev->tx_buf) {
         dev_err(&pdev->dev, "failed to allocate %zu-byte TX ring\n", tdev->ring_bytes);
-        return -ENOMEM;
+        ret = -ENOMEM;
+        goto err_free_rx;
     }
 
     memset(tdev->rx_buf, 0, tdev->ring_bytes);
@@ -482,7 +576,7 @@ static int t510_dma_v2_probe(struct platform_device *pdev)
 
     ret = t510_dma_v2_request_channels(tdev);
     if (ret)
-        return ret;
+        goto err_free_rx;
 
     tdev->miscdev.minor = MISC_DYNAMIC_MINOR;
     tdev->miscdev.name = "t510_dma_stream";
@@ -493,15 +587,23 @@ static int t510_dma_v2_probe(struct platform_device *pdev)
     if (ret) {
         dev_err(&pdev->dev, "failed to register misc device: %d\n", ret);
         t510_dma_v2_release_channels(tdev);
-        return ret;
+        goto err_free_rx;
     }
 
     platform_set_drvdata(pdev, tdev);
     dev_info(&pdev->dev,
-             "registered /dev/%s: %u periods x %u bytes per ring (rx dma=%pad tx dma=%pad)\n",
+             "registered /dev/%s: %u periods x %u bytes per ring, RX ring %s (rx dma=%pad tx dma=%pad)\n",
              tdev->miscdev.name, tdev->num_periods, tdev->period_bytes,
+             T510_RX_CACHEABLE ? "cacheable" : "coherent",
              &tdev->rx_dma_addr, &tdev->tx_dma_addr);
     return 0;
+
+err_free_rx:
+#if T510_RX_CACHEABLE
+    dma_free_noncoherent(&pdev->dev, tdev->ring_bytes, tdev->rx_buf,
+                         tdev->rx_dma_addr, DMA_FROM_DEVICE);
+#endif
+    return ret;
 }
 
 static int t510_dma_v2_remove(struct platform_device *pdev)
@@ -513,6 +615,12 @@ static int t510_dma_v2_remove(struct platform_device *pdev)
     mutex_unlock(&tdev->lock);
 
     misc_deregister(&tdev->miscdev);
+#if T510_RX_CACHEABLE
+    /* RX ring was allocated by hand (no devm_); release it (DMA already stopped
+     * by stop_all above). TX ring is devm-managed and freed automatically. */
+    dma_free_noncoherent(tdev->dev, tdev->ring_bytes, tdev->rx_buf,
+                         tdev->rx_dma_addr, DMA_FROM_DEVICE);
+#endif
     return 0;
 }
 
