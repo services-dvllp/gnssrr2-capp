@@ -245,7 +245,14 @@ bitstream instantiates all four tiles with MTS.
   memcpy itself: if the read out of the coherent ring alone cannot sustain
   ≈983 MB/s, overruns still occur (and are detected/counted/logged identically).
   The on-disk format, CLI, overrun semantics and shutdown behaviour are
-  unchanged.
+  unchanged. The copy out of the **non-cacheable** coherent ring is the measured
+  bottleneck (a single core saturates uncached reads well below the stream
+  rate), so it is **spread across cores**: the producer fans each batch's copy
+  over N worker threads (split by whole period, byte-identical result). N
+  defaults to the online CPU count (clamped to 8) and can be overridden with the
+  `RX_COPY_THREADS` environment variable (`1` = the original inline single-thread
+  copy). The exit log prints per-stage `ring->RAM copy` and `RAM->SSD write`
+  rates so the limiting stage can be measured directly.
 - **Ring sizing (`num_periods`).** Default is 64 periods × 1 MiB = 64 MiB per
   ring; the RX and TX rings are both allocated, so coherent DMA use is
   `2 × period_bytes × num_periods` (128 MiB at the default). This memory is

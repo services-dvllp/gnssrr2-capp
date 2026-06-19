@@ -387,6 +387,184 @@ static void cap_pipe_destroy(struct cap_pipe *pipe)
     pthread_cond_destroy(&pipe->can_consume);
 }
 
+/* ------------------------------------------------------------------------- *
+ * Parallel ring->RAM copy pool.
+ *
+ * The single-threaded memcpy out of the non-cacheable dma_mmap_coherent ring is
+ * the measured bottleneck: each uncached load has full memory latency and one
+ * core can only keep a few in flight, so a single core saturates well below the
+ * DMA stream rate. Spreading the copy of one batch across several cores lets
+ * each core issue its own stream of outstanding uncached reads, aggregating
+ * far more memory bandwidth. This is a persistent fork-join pool (created once,
+ * one job per drain batch) so there is no per-batch thread-creation cost.
+ *
+ * The job is split by whole periods: worker w copies the period sub-range
+ * [w*batch/W, (w+1)*batch/W). Destination offsets (j*period_bytes) are disjoint
+ * per worker and the ring source is read-only, so the workers never touch the
+ * same bytes -- no locking on the data, only on job dispatch/completion. The
+ * bytes produced are identical to the old two-memcpy path; only the work is
+ * parallel. With nworkers == 1 the producer copies inline and no pool is used,
+ * exactly reproducing the previous behaviour.
+ * ------------------------------------------------------------------------- */
+#define RX_MAX_COPY_THREADS  8
+
+struct copy_pool;
+struct copy_worker {
+    struct copy_pool *pool;
+    int               id;
+    pthread_t         tid;
+};
+
+struct copy_pool {
+    pthread_mutex_t mtx;
+    pthread_cond_t  start;     /* a new job is available             */
+    pthread_cond_t  done;      /* a worker finished its slice        */
+    int             nworkers;
+    struct copy_worker workers[RX_MAX_COPY_THREADS];
+
+    /* current job (valid while remaining > 0) */
+    const uint8_t  *ring;
+    uint8_t        *dst;
+    uint32_t        idx;
+    uint32_t        num_periods;
+    uint32_t        period_bytes;
+    uint64_t        batch;
+
+    uint64_t        gen;        /* incremented once per dispatched job */
+    int             remaining;  /* workers still busy on this gen      */
+    int             quit;       /* teardown signal                     */
+};
+
+/* One worker's portion of the current job: copy its disjoint period sub-range. */
+static void copy_pool_do_slice(struct copy_pool *pool, int id)
+{
+    uint64_t batch = pool->batch;
+    int      W     = pool->nworkers;
+    uint64_t lo    = (uint64_t)id * batch / (uint64_t)W;
+    uint64_t hi    = (uint64_t)(id + 1) * batch / (uint64_t)W;
+    uint32_t np    = pool->num_periods;
+    uint32_t pb    = pool->period_bytes;
+    uint64_t j;
+
+    for (j = lo; j < hi; j++) {
+        uint32_t ring_idx = (uint32_t)((pool->idx + j) % np);
+        memcpy(pool->dst + j * pb,
+               pool->ring + (size_t)ring_idx * pb,
+               pb);
+    }
+}
+
+static void *copy_worker_thread(void *arg)
+{
+    struct copy_worker *w = arg;
+    struct copy_pool *pool = w->pool;
+    uint64_t last_gen = 0;
+
+    for (;;) {
+        pthread_mutex_lock(&pool->mtx);
+        while (pool->gen == last_gen && !pool->quit)
+            pthread_cond_wait(&pool->start, &pool->mtx);
+        if (pool->quit) {
+            pthread_mutex_unlock(&pool->mtx);
+            return NULL;
+        }
+        last_gen = pool->gen;
+        pthread_mutex_unlock(&pool->mtx);
+
+        copy_pool_do_slice(pool, w->id);
+
+        pthread_mutex_lock(&pool->mtx);
+        if (--pool->remaining == 0)
+            pthread_cond_signal(&pool->done);
+        pthread_mutex_unlock(&pool->mtx);
+    }
+}
+
+/* Create nworkers-1 helper threads (worker 0 is the calling producer, which
+ * does its own slice inline so its core is not left idle). Returns 0, or -1 if
+ * a thread could not be created (callers fall back to the inline single-thread
+ * copy). */
+static int copy_pool_init(struct copy_pool *pool, int nworkers)
+{
+    int i;
+
+    memset(pool, 0, sizeof(*pool));
+    pthread_mutex_init(&pool->mtx, NULL);
+    pthread_cond_init(&pool->start, NULL);
+    pthread_cond_init(&pool->done, NULL);
+    pool->nworkers = nworkers;
+
+    for (i = 0; i < nworkers; i++) {
+        pool->workers[i].pool = pool;
+        pool->workers[i].id   = i;
+    }
+    /* Helpers are ids 1..nworkers-1; id 0 runs inline on the producer. */
+    for (i = 1; i < nworkers; i++) {
+        if (pthread_create(&pool->workers[i].tid, NULL,
+                           copy_worker_thread, &pool->workers[i]) != 0) {
+            /* Tear down whatever started and report failure. */
+            pthread_mutex_lock(&pool->mtx);
+            pool->quit = 1;
+            pthread_cond_broadcast(&pool->start);
+            pthread_mutex_unlock(&pool->mtx);
+            while (--i >= 1)
+                pthread_join(pool->workers[i].tid, NULL);
+            pthread_mutex_destroy(&pool->mtx);
+            pthread_cond_destroy(&pool->start);
+            pthread_cond_destroy(&pool->done);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void copy_pool_destroy(struct copy_pool *pool)
+{
+    int i;
+
+    pthread_mutex_lock(&pool->mtx);
+    pool->quit = 1;
+    pthread_cond_broadcast(&pool->start);
+    pthread_mutex_unlock(&pool->mtx);
+
+    for (i = 1; i < pool->nworkers; i++)
+        pthread_join(pool->workers[i].tid, NULL);
+
+    pthread_mutex_destroy(&pool->mtx);
+    pthread_cond_destroy(&pool->start);
+    pthread_cond_destroy(&pool->done);
+}
+
+/* Dispatch one batch copy across the pool and block until every worker slice is
+ * done. Called only by the producer thread (single dispatcher), so the job
+ * fields need no extra serialisation beyond the start/done handshake. */
+static void copy_pool_run(struct copy_pool *pool, const uint8_t *ring,
+                          uint8_t *dst, uint32_t idx, uint32_t num_periods,
+                          uint32_t period_bytes, uint64_t batch)
+{
+    pthread_mutex_lock(&pool->mtx);
+    pool->ring         = ring;
+    pool->dst          = dst;
+    pool->idx          = idx;
+    pool->num_periods  = num_periods;
+    pool->period_bytes = period_bytes;
+    pool->batch        = batch;
+    pool->remaining    = pool->nworkers;
+    pool->gen++;
+    pthread_cond_broadcast(&pool->start);
+    pthread_mutex_unlock(&pool->mtx);
+
+    /* Worker 0 runs inline on this (producer) thread. */
+    copy_pool_do_slice(pool, 0);
+
+    pthread_mutex_lock(&pool->mtx);
+    if (--pool->remaining == 0)
+        pthread_cond_signal(&pool->done);
+    while (pool->remaining > 0)
+        pthread_cond_wait(&pool->done, &pool->mtx);
+    pthread_mutex_unlock(&pool->mtx);
+}
+
 /* Producer thread: DMA ring -> RAM. Mirrors the original single-threaded drain
  * loop exactly (GET_STATUS / WAIT_RX / overrun detect-and-resync / period
  * copy-out); the only difference is that the copied batch is handed to the
@@ -397,6 +575,7 @@ struct producer_args {
     double          duration_sec;
     double          t_start;
     struct cap_pipe *pipe;
+    struct copy_pool *cpool;        /* NULL => inline single-thread memcpy   */
 
     /* outputs, read by main after join */
     uint64_t        local_count;     /* periods copied out of the ring        */
@@ -485,13 +664,24 @@ static void *producer_thread(void *arg)
 
             {
                 uint64_t t0 = now_ns();
-                memcpy(pipe->bufs[bi].base,
-                       p->rx_ring + (size_t)idx * status.period_bytes,
-                       (size_t)first * status.period_bytes);
-                if (batch > first)
-                    memcpy((uint8_t *)pipe->bufs[bi].base + (size_t)first * status.period_bytes,
-                           p->rx_ring,
-                           (size_t)(batch - first) * status.period_bytes);
+                if (p->cpool) {
+                    /* Parallel copy across cores; splits by period and handles
+                     * the ring wrap internally (period (idx+j) % num_periods). */
+                    copy_pool_run(p->cpool, p->rx_ring,
+                                  (uint8_t *)pipe->bufs[bi].base,
+                                  idx, status.num_periods, status.period_bytes,
+                                  batch);
+                } else {
+                    /* Inline single-thread path (identical to the original):
+                     * one memcpy up to the ring end, one for the wrapped tail. */
+                    memcpy(pipe->bufs[bi].base,
+                           p->rx_ring + (size_t)idx * status.period_bytes,
+                           (size_t)first * status.period_bytes);
+                    if (batch > first)
+                        memcpy((uint8_t *)pipe->bufs[bi].base + (size_t)first * status.period_bytes,
+                               p->rx_ring,
+                               (size_t)(batch - first) * status.period_bytes);
+                }
                 p->copy_ns    += now_ns() - t0;
                 p->copy_bytes += nbytes;
             }
@@ -604,6 +794,9 @@ int main(int argc, char **argv)
 
     struct cap_pipe pipe;
     int pipe_inited = 0;
+    struct copy_pool cpool;
+    int cpool_inited = 0;
+    int copy_threads = 1;
     pthread_t producer_tid, consumer_tid;
     int producer_started = 0, consumer_started = 0;
     struct producer_args pargs;
@@ -761,6 +954,44 @@ int main(int argc, char **argv)
         goto fail;
     }
 
+    /* Decide how many cores copy the ring -> RAM. Default to the online CPU
+     * count (clamped to RX_MAX_COPY_THREADS); override with RX_COPY_THREADS.
+     * 1 keeps the original inline single-thread memcpy. The pool is created
+     * once and reused for every batch. */
+    {
+        long onln = sysconf(_SC_NPROCESSORS_ONLN);
+        int want = (onln > 0) ? (int)onln : 1;
+        const char *env = getenv("RX_COPY_THREADS");
+
+        if (env && *env) {
+            char *end;
+            long v = strtol(env, &end, 10);
+            if (*end == '\0' && v >= 1 && v <= RX_MAX_COPY_THREADS)
+                want = (int)v;
+            else
+                fprintf(stderr,
+                    "rx_stream: ignoring invalid RX_COPY_THREADS='%s' (use 1..%d)\n",
+                    env, RX_MAX_COPY_THREADS);
+        }
+        if (want > RX_MAX_COPY_THREADS)
+            want = RX_MAX_COPY_THREADS;
+        if (want < 1)
+            want = 1;
+        copy_threads = want;
+    }
+
+    if (copy_threads > 1) {
+        if (copy_pool_init(&cpool, copy_threads) == 0) {
+            cpool_inited = 1;
+        } else {
+            fprintf(stderr,
+                "rx_stream: copy pool init failed; using single-thread copy\n");
+            copy_threads = 1;
+        }
+    }
+    fprintf(stderr, "rx_stream: ring->RAM copy uses %d core(s)%s\n",
+            copy_threads, cpool_inited ? "" : " (inline)");
+
     /* Spawn the consumer (RAM -> SSD) first, then the producer (DMA -> RAM).
      * The producer races the DMA ring; the consumer drains the staging pool to
      * the SSD in parallel, so the SSD write latency is off the ring-drain path. */
@@ -775,6 +1006,7 @@ int main(int argc, char **argv)
     pargs.duration_sec = duration_sec;
     pargs.t_start      = t_start;
     pargs.pipe         = &pipe;
+    pargs.cpool        = cpool_inited ? &cpool : NULL;
 
     if (pthread_create(&consumer_tid, NULL, consumer_thread, &cargs) != 0) {
         perror("pthread_create(consumer)");
@@ -874,6 +1106,8 @@ fail:
         close(out_fd);
     }
 
+    if (cpool_inited)
+        copy_pool_destroy(&cpool);
     if (pipe_inited)
         cap_pipe_destroy(&pipe);
     free(hdr_buf);
