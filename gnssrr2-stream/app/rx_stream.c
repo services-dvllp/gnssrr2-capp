@@ -159,17 +159,6 @@ static double now_monotonic(void)
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1.0e9;
 }
 
-/* Monotonic nanoseconds, for per-stage (copy vs write) throughput accounting.
- * Sampled once per drain batch (not per period), so the overhead is negligible
- * relative to the work it brackets. */
-static uint64_t now_ns(void)
-{
-    struct timespec ts;
-
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-}
-
 /* ---- validated positional-argument parsers (report, never silently ignore) ---- */
 
 static int parse_double_arg(const char *s, const char *name, double *out)
@@ -401,8 +390,6 @@ struct producer_args {
     /* outputs, read by main after join */
     uint64_t        local_count;     /* periods copied out of the ring        */
     uint64_t        overrun_count;
-    uint64_t        copy_ns;         /* total time in ring->RAM memcpy        */
-    uint64_t        copy_bytes;      /* total bytes copied out of the ring    */
     int             failed;          /* non-signal ioctl error                */
 };
 
@@ -483,18 +470,13 @@ static void *producer_thread(void *arg)
             bi = pipe->free_idx[--pipe->free_top];
             pthread_mutex_unlock(&pipe->mtx);
 
-            {
-                uint64_t t0 = now_ns();
-                memcpy(pipe->bufs[bi].base,
-                       p->rx_ring + (size_t)idx * status.period_bytes,
-                       (size_t)first * status.period_bytes);
-                if (batch > first)
-                    memcpy((uint8_t *)pipe->bufs[bi].base + (size_t)first * status.period_bytes,
-                           p->rx_ring,
-                           (size_t)(batch - first) * status.period_bytes);
-                p->copy_ns    += now_ns() - t0;
-                p->copy_bytes += nbytes;
-            }
+            memcpy(pipe->bufs[bi].base,
+                   p->rx_ring + (size_t)idx * status.period_bytes,
+                   (size_t)first * status.period_bytes);
+            if (batch > first)
+                memcpy((uint8_t *)pipe->bufs[bi].base + (size_t)first * status.period_bytes,
+                       p->rx_ring,
+                       (size_t)(batch - first) * status.period_bytes);
             pipe->bufs[bi].len = nbytes;
 
             pthread_mutex_lock(&pipe->mtx);
@@ -527,7 +509,6 @@ struct consumer_args {
 
     /* outputs, read by main after join */
     uint64_t        bytes_written;   /* IQ payload bytes actually written     */
-    uint64_t        write_ns;        /* total time in RAM->SSD pwrite         */
     int             failed;          /* pwrite() error                        */
 };
 
@@ -554,20 +535,15 @@ static void *consumer_thread(void *arg)
         pthread_mutex_unlock(&pipe->mtx);
 
         len = pipe->bufs[bi].len;
-        {
-            uint64_t t0 = now_ns();
-            int wrc = write_all_at(c->out_fd, pipe->bufs[bi].base, len, c->payload_off);
-            c->write_ns += now_ns() - t0;
-            if (wrc != 0) {
-                perror("pwrite(output)");
-                c->failed = 1;
-                pthread_mutex_lock(&pipe->mtx);
-                pipe->abort = 1;
-                pthread_cond_broadcast(&pipe->can_produce);
-                pthread_cond_broadcast(&pipe->can_consume);
-                pthread_mutex_unlock(&pipe->mtx);
-                break;
-            }
+        if (write_all_at(c->out_fd, pipe->bufs[bi].base, len, c->payload_off) != 0) {
+            perror("pwrite(output)");
+            c->failed = 1;
+            pthread_mutex_lock(&pipe->mtx);
+            pipe->abort = 1;
+            pthread_cond_broadcast(&pipe->can_produce);
+            pthread_cond_broadcast(&pipe->can_consume);
+            pthread_mutex_unlock(&pipe->mtx);
+            break;
         }
         c->payload_off   += (off_t)len;
         c->bytes_written += len;
@@ -837,24 +813,6 @@ fail:
                 (unsigned long long)bytes_written,
                 (double)bytes_written / (1024.0 * 1024.0),
                 (unsigned long long)overrun_count);
-    }
-
-    /* Per-stage throughput diagnostic: the in-thread time actually spent in the
-     * ring->RAM memcpy vs the RAM->SSD pwrite, and the rate each stage sustained
-     * (bytes / time-in-that-stage). Whichever rate is the lower is the wall the
-     * pipeline is hitting -- this is what tells us where to optimise, instead of
-     * guessing. Purely informational; it changes nothing in the capture path. */
-    {
-        double copy_s  = (double)pargs.copy_ns  / 1.0e9;
-        double write_s = (double)cargs.write_ns / 1.0e9;
-        double copy_mb  = (double)pargs.copy_bytes / (1024.0 * 1024.0);
-        double write_mb = (double)bytes_written    / (1024.0 * 1024.0);
-
-        fprintf(stderr,
-                "rx_stream: stage rates: ring->RAM copy %.1f MB/s (%.1f MB in %.3fs); "
-                "RAM->SSD write %.1f MB/s (%.1f MB in %.3fs)\n",
-                copy_s  > 0.0 ? copy_mb  / copy_s  : 0.0, copy_mb,  copy_s,
-                write_s > 0.0 ? write_mb / write_s : 0.0, write_mb, write_s);
     }
 
     /* Update the header with the final IQ byte count (on normal completion,
