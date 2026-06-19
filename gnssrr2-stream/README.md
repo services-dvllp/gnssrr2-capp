@@ -234,7 +234,18 @@ bitstream instantiates all four tiles with MTS.
   exit) so the block allocator never stalls the hot path. O_DIRECT needs the IQ
   payload offset (512) to be a multiple of the logical sector; on a 4Kn device
   the 512-byte header write returns `EINVAL` and the writer falls back to
-  buffered I/O automatically.
+  buffered I/O automatically; (3) runs a **two-thread pipeline** — a *producer*
+  (DMA→RAM: GET_STATUS/WAIT_RX, overrun resync, memcpy of each completed batch
+  out of the non-cacheable coherent ring into a free RAM staging buffer) and a
+  *consumer* (RAM→SSD: `pwrite` of each filled buffer), joined by a small
+  bounded pool of `RX_NUM_WRITE_BUFS` page-aligned buffers (mutex + two
+  condvars). Overlapping the slow uncached read with the SSD write makes the
+  DMA-racing path cost `max(memcpy, write)` instead of their sum, and keeps the
+  ring draining while a write is in flight. This does **not** speed the uncached
+  memcpy itself: if the read out of the coherent ring alone cannot sustain
+  ≈983 MB/s, overruns still occur (and are detected/counted/logged identically).
+  The on-disk format, CLI, overrun semantics and shutdown behaviour are
+  unchanged.
 - **Ring sizing (`num_periods`).** Default is 64 periods × 1 MiB = 64 MiB per
   ring; the RX and TX rings are both allocated, so coherent DMA use is
   `2 × period_bytes × num_periods` (128 MiB at the default). This memory is
