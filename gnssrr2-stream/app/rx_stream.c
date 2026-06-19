@@ -24,22 +24,22 @@
  *      coalesced into one large write per drain to cut syscall overhead.
  *
  *      O_DIRECT requires block-aligned buffer / length / file-offset and a
- *      pinnable (GUP-able) source buffer. The DMA ring is a dma_mmap_coherent
- *      mapping (VM_PFNMAP, non-cacheable) which O_DIRECT cannot pin, so periods
- *      are memcpy'd from the ring into a page-aligned RAM bounce buffer first
- *      (the old buffered FILE* did an equivalent copy into its stdio buffer).
+ *      pinnable (GUP-able) source buffer. The DMA ring is a remap_pfn_range
+ *      mapping (VM_PFNMAP) which O_DIRECT cannot pin, so periods are memcpy'd
+ *      from the ring into a page-aligned RAM bounce buffer first (the old
+ *      buffered FILE* did an equivalent copy into its stdio buffer).
  *      The 512-byte header keeps the IQ payload at file offset 512; that is a
  *      multiple of a 512-byte logical sector, so O_DIRECT works on the usual
  *      512e NVMe. On a 4Kn device the 512-byte header write returns EINVAL and
  *      the code transparently falls back to a buffered (page-cache) write.
  *
- *   6. The capture path is split into two threads so the (slow) read out of the
- *      non-cacheable DMA ring and the SSD write no longer run back-to-back in
- *      one loop:
+ *   6. The capture path is split into two threads so the ring->RAM read and the
+ *      SSD write no longer run back-to-back in one loop:
  *
  *         producer (DMA -> RAM): polls GET_STATUS/WAIT_RX, does the overrun
- *             detect-and-resync, and memcpy's each batch of completed periods
- *             out of the coherent ring into a free RAM staging buffer.
+ *             detect-and-resync, issues SYNC_RX to invalidate the caches for the
+ *             completed periods, and memcpy's each batch out of the ring into a
+ *             free RAM staging buffer.
  *         consumer (RAM -> SSD): pwrite()s each filled staging buffer to the
  *             output file.
  *
@@ -49,11 +49,16 @@
  *      with the DMA if that SUM stayed under the period interval; while a write
  *      was in flight nothing drained the ring. Overlapping the two makes the
  *      DMA-racing path cost max(memcpy, write) instead, and the SSD write no
- *      longer blocks the ring drain. This does NOT speed the memcpy itself: if
- *      the read out of the non-cacheable ring alone cannot sustain the stream
- *      rate, overruns still occur (and are still detected/counted/ logged
- *      identically). The on-disk format, CLI, overrun semantics and shutdown
- *      behavior are unchanged; only the internal pipelining differs.
+ *      longer blocks the ring drain. The on-disk format, CLI, overrun semantics
+ *      and shutdown behavior are unchanged; only the internal pipelining differs.
+ *
+ *   7. The DMA ring is mapped CACHEABLE (the driver allocates it with
+ *      dma_alloc_noncoherent and the app invalidates each completed batch via
+ *      the T510_DMA_V2_IOC_SYNC_RX ioctl before reading it). Reading a coherent
+ *      (Normal Non-Cacheable) ring capped the ring->RAM memcpy near ~136 MB/s on
+ *      the T510 -- far below the ~983 MB/s stream -- which alone caused the
+ *      overruns regardless of pipelining. A cacheable copy runs at multi-GB/s,
+ *      so the ring drain keeps up with the stream.
  *
  * The RF parameters (LO/BW/Fs/ADC-bits/Gain, per channel) are accepted and
  * stored in the header for self-description only. They are NOT pushed into the
@@ -455,6 +460,24 @@ static void *producer_thread(void *arg)
 
             if (first > batch)
                 first = batch;
+
+            /* The RX ring is cacheable, so the DMA-written bytes for these just-
+             * completed periods may still be sitting in DRAM behind stale CPU
+             * cache lines. Invalidate them in the driver before the memcpy reads
+             * them; that is what turns this from an uncached crawl into a cache-
+             * speed copy. (ENOTTY = a coherent/older driver that needs no sync.) */
+            {
+                struct t510_dma_v2_sync sync = {
+                    .period_start = idx,
+                    .period_count = batch,
+                };
+                if (ioctl(p->fd, T510_DMA_V2_IOC_SYNC_RX, &sync) != 0 &&
+                    errno != ENOTTY) {
+                    perror("ioctl(sync_rx)");
+                    p->failed = 1;
+                    break;
+                }
+            }
 
             /* Acquire a free staging buffer (blocks if the consumer is behind;
              * that back-pressure lets the ring fill and is what an overrun is
