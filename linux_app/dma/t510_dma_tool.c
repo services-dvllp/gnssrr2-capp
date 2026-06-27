@@ -116,7 +116,6 @@ static void format_tx_buffer_exact(int16_t *tx_buf)
      * Stopping at the end of the table instead would leave 53% of the ring
      * zero-filled and transmit 1 ms of tone followed by 1.13 ms of silence.
      */
-	int count=0;
     while (dst_idx < T510_DMA_TOTAL_SAMPLES) {
 
         /* First 8 samples (DAC stream 0, tdata[127:0]) */
