@@ -67,20 +67,20 @@ cd /home/linux_proj/t510_port-main/linux_app
 ./t510_rf_init -t 1 --skip-mts
 ```
 
-Then in the DMA folder, unload any previous instance before inserting the newly built module:
-
-```sh
-make unload
-insmod ./t510_dma_loopback.ko
-./t510_dma_tool --capture-ms 1000 --csv -
-```
-
-If you prefer to type the unload commands manually, use module names, not `.ko`
-filenames:
+Then in the DMA folder, unload any previous instance before inserting the newly built module. Use module names with `rmmod`, not `.ko` filenames:
 
 ```sh
 rmmod t510_dma_loopback 2>/dev/null || true
 rmmod t510_dma_stream 2>/dev/null || true
+insmod ./t510_dma_loopback.ko
+./t510_dma_tool --capture-ms 1000 --csv -
+```
+
+The Makefile also provides the same unload sequence as a helper when this
+version of the Makefile is installed on the target:
+
+```sh
+make unload
 insmod ./t510_dma_loopback.ko
 ```
 
