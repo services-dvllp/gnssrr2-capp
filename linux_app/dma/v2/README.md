@@ -17,7 +17,7 @@ periods.
 ```
 v2/
   driver/
-    t510_dma_stream.c          kernel module
+    t510_dma_stream.c            kernel module
     t510_dma_stream_ioctl.h     shared ioctl/mmap ABI (single copy, used by driver and app)
     Makefile
   app/
@@ -74,11 +74,11 @@ continues. `--loop` wraps the input file for indefinite playback.
 ## Binding / module loading
 
 `t510_dma_stream` matches the *same* device-tree node as
-`t510_dma_loopback` (`compatible = "antsdr,t510-dma-loopback"`, dma-names
+`t510_dma_stream` (`compatible = "antsdr,t510-dma-stream"`, dma-names
 `"tx"`/`"rx"`), so **only one of the two drivers can be bound at a time**:
 
 ```bash
-rmmod t510_dma_loopback 2>/dev/null
+rmmod t510_dma_stream 2>/dev/null
 insmod t510_dma_stream.ko          # optionally: num_periods=32 period_bytes=1048576
 ```
 
@@ -94,7 +94,7 @@ make -C v2/driver KDIR=/path/to/petalinux_proj/t510zcu47dr/build/tmp/work-shared
 
 (`v2/driver/t510_dma_stream.ko` is produced. Substitute the actual kernel
 source/build dir from the PetaLinux project, matching the `KDIR` used to
-build `t510_dma_loopback.ko`.)
+build `t510_dma_stream.ko`.)
 
 User-space apps (cross-compile):
 
@@ -109,8 +109,8 @@ make -C v2/app CC=aarch64-linux-gnu-gcc
 On the board, as root:
 
 ```bash
-# load the v2 driver (only one of t510_dma_loopback / t510_dma_stream at a time)
-rmmod t510_dma_loopback 2>/dev/null; insmod t510_dma_stream.ko
+# load the v2 driver (only one of t510_dma_stream / t510_dma_stream at a time)
+rmmod t510_dma_stream 2>/dev/null; insmod t510_dma_stream.ko
 
 # RFDC bring-up (per top-level README, must run twice)
 /home/rfdc-dma-app-main/t510_port-main/linux_app/t510_rf_init

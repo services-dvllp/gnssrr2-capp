@@ -104,12 +104,12 @@ each tool calls its own `STOP_RX`/`STOP_TX` explicitly before exiting, and
 `t510_dma_v2_remove()` (module unload) calls `t510_dma_v2_stop_all_locked()`
 as the final safety net.
 
-### 1.7 Why it binds to the same device-tree node as `t510_dma_loopback`
+### 1.7 Why it binds to the same device-tree node as `t510_dma_stream`
 
-`t510_dma_v2_of_match` matches both `"antsdr,t510-dma-loopback"` (the
+`t510_dma_v2_of_match` matches both `"antsdr,t510-dma-stream"` (the
 existing DT node, unchanged) and a new `"antsdr,t510-dma-stream"` string —
 so no device-tree/bitstream changes are required to switch drivers, just
-`rmmod t510_dma_loopback; insmod t510_dma_stream.ko`. Only one driver can be
+`rmmod t510_dma_stream; insmod t510_dma_stream.ko`. Only one driver can be
 bound to the node at a time, which is enforced by the platform-driver model
 itself (no extra code needed).
 

@@ -1,4 +1,4 @@
-# T510 Linux DMA Loopback
+# T510 Linux DMA Stream
 
 This folder adds the Linux data path for the T510 RFSoC loopback flow:
 
@@ -28,11 +28,11 @@ Add a node like this to your Linux device tree and rebuild the boot image:
 
 ```dts
 / {
-    t510_dma_loopback {
-        compatible = "antsdr,t510-dma-loopback";
+    t510_dma_stream {
+        compatible = "antsdr,t510-dma-stream";
         dmas = <&axi_dma_0 0>, <&axi_dma_0 1>;
         dma-names = "tx", "rx";
-        dma-coherent;
+        // dma-coherent;
     };
 };
 ```
@@ -42,6 +42,7 @@ Assumptions:
 - `&axi_dma_0` is your existing AXI DMA instance.
 - Channel `0` is MM2S and channel `1` is S2MM.
 - The kernel already includes the Xilinx AXI DMA driver (`CONFIG_XILINX_DMA`).
+- If the generated `&axi_dma_0` node contains `dma-coherent`, delete it for this non-coherent stream path.
 
 ## Build
 
@@ -54,7 +55,7 @@ make
 
 This builds:
 
-- `t510_dma_loopback.ko`
+- `t510_dma_stream.ko`
 - `t510_dma_tool`
 
 ## Load and run
@@ -69,7 +70,7 @@ cd /home/linux_proj/t510_port-main/linux_app
 Then in the DMA folder:
 
 ```sh
-insmod ./t510_dma_loopback.ko
+insmod ./t510_dma_stream.ko
 ./t510_dma_tool --capture-ms 1000 --csv -
 ```
 
