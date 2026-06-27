@@ -2,7 +2,7 @@
  * t510_dma_stream.c - Continuous (gap-free) AXI DMA record/replay driver
  * for the ANTSDR T510 RFDC datapath.
  *
- * Unlike t510_dma_loopback.c (one-shot RX captures + single-buffer cyclic
+ * Unlike the v1 single-buffer driver (one-shot RX captures + single-buffer cyclic
  * TX, both requiring a terminate/restart cycle to move to new data), this
  * driver submits ONE cyclic descriptor chain per direction that loops over
  * a multi-period ring buffer forever. The DMA engine itself never stops
@@ -18,10 +18,8 @@
  *       period with the next chunk of the replay file before the hardware
  *       wraps back around to play it again N periods later.
  *
- * This binds to the same device-tree node as t510_dma_loopback ("antsdr,
- * t510-dma-loopback", dma-names "tx"/"rx"), so only one of the two drivers
- * may be loaded at a time: `rmmod t510_dma_loopback` before
- * `insmod t510_dma_stream.ko`.
+ * This binds to the `antsdr,t510-dma-stream` device-tree node with
+ * dma-names "tx"/"rx".
  */
 
 #include <linux/atomic.h>
@@ -493,7 +491,6 @@ static int t510_dma_v2_remove(struct platform_device *pdev)
 }
 
 static const struct of_device_id t510_dma_v2_of_match[] = {
-    { .compatible = "antsdr,t510-dma-loopback" },
     { .compatible = "antsdr,t510-dma-stream" },
     { }
 };

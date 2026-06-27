@@ -1,5 +1,5 @@
 ifneq ($(KERNELRELEASE),)
-obj-m := t510_dma_loopback.o
+obj-m := t510_dma_stream.o
 else
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD  := $(shell pwd)

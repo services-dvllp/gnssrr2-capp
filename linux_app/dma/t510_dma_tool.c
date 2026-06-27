@@ -12,7 +12,7 @@
 
 #include "t510_dma_ioctl.h"
 
-#define DEFAULT_DEVICE       "/dev/t510_dma_loopback"
+#define DEFAULT_DEVICE       "/dev/t510_dma_stream"
 #define DEFAULT_CAPTURE_MS   1000U
 #define DEFAULT_PREVIEW_PAIRS 16U
 #define SAMPLES_PER_BLOCK    8U

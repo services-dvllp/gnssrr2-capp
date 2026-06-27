@@ -1,7 +1,7 @@
 # T510 DMA Capture Tool (`t510_dma_tool`)
 
 User-space capture tool for the ANTSDR T510 RFSoC RX DMA path. It drains the
-cyclic RX DMA ring driven by the `t510_dma_loopback` kernel module and writes
+cyclic RX DMA ring driven by the `t510_dma_stream` kernel module and writes
 the captured IQ samples to CSV and/or raw binary, sized exactly to the
 requested `--capture-ms` duration.
 
@@ -20,7 +20,7 @@ On the board (needs kernel headers for the module; the user tool only needs
 
 ```sh
 cd /home/dma-test-main/linux_app/dma
-make            # builds t510_dma_loopback.ko and t510_dma_tool
+make            # builds t510_dma_stream.ko and t510_dma_tool
 ```
 
 To build only the user-space tool (no kernel headers required):
@@ -43,14 +43,14 @@ make user
 
    ```sh
    cd /home/dma-test-main/linux_app/dma
-   insmod ./t510_dma_loopback.ko
+   insmod ./t510_dma_stream.ko
    ./t510_dma_tool --capture-ms 2 --csv /home/c_capture.csv
    ```
 
 Options:
 
 ```
---device PATH     DMA device (default /dev/t510_dma_loopback)
+--device PATH     DMA device (default /dev/t510_dma_stream)
 --capture-ms N    amount of captured signal, in milliseconds (default 1000)
 --csv PATH        write IQ pairs as CSV (use - for stdout)
 --bin PATH        write raw RX samples as binary (int16 little-endian)
@@ -143,9 +143,8 @@ Driver totals: tx_periods=... rx_periods=... dropped_periods=...
 
 - Sources live in `/home/dma-test-main/linux_app/dma`; prebuilt artifacts (if
   used) are in `/home/dma-test-main/linux_app/build_output`.
-- The kernel module must be loaded (`insmod ./t510_dma_loopback.ko`) and the
-  device tree must contain the `antsdr,t510-dma-loopback` node (present in
-  `systemJun9.dts`) so `/dev/t510_dma_loopback` exists.
+- The kernel module must be loaded (`insmod ./t510_dma_stream.ko`) and the
+  device tree must contain the `antsdr,t510-dma-stream` node so `/dev/t510_dma_stream` exists.
 - Write captures to a filesystem with enough free space (e.g. `/home`):
   1000 ms is ~1 GB binary or ~3 GB CSV.
 - If the tool prints `DMA stalled: no new RX period for 5000 ms`, the RX
