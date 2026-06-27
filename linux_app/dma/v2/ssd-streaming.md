@@ -6,7 +6,7 @@ This describes the `v2` continuous (gap-free) record/replay stack —
 reasoning behind its design. For the throughput ceiling this design is built
 against (RFDC rate vs. NVMe link), see `docs/OPEN_QUESTIONS.md` §1.6/§4.4.
 
-It supersedes `v1` (`t510_dma_loopback.c` + `rx.c`/`tx.c`), which is
+It supersedes `v1` (`t510_dma_stream.c` + `rx.c`/`tx.c`), which is
 DDR-loopback-only and stops/restarts the DMA channel between every 2 MB
 block (a real gap between blocks — see `v1`'s known issues in
 `docs/sw-arch.md`).
@@ -104,12 +104,12 @@ each tool calls its own `STOP_RX`/`STOP_TX` explicitly before exiting, and
 `t510_dma_v2_remove()` (module unload) calls `t510_dma_v2_stop_all_locked()`
 as the final safety net.
 
-### 1.7 Why it binds to the same device-tree node as `t510_dma_loopback`
+### 1.7 Why it binds to the same device-tree node as `t510_dma_stream`
 
-`t510_dma_v2_of_match` matches both `"antsdr,t510-dma-loopback"` (the
+`t510_dma_v2_of_match` matches both `"antsdr,t510-dma-stream"` (the
 existing DT node, unchanged) and a new `"antsdr,t510-dma-stream"` string —
 so no device-tree/bitstream changes are required to switch drivers, just
-`rmmod t510_dma_loopback; insmod t510_dma_stream.ko`. Only one driver can be
+`rmmod t510_dma_stream; insmod t510_dma_stream.ko`. Only one driver can be
 bound to the node at a time, which is enforced by the platform-driver model
 itself (no extra code needed).
 

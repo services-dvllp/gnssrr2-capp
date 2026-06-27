@@ -1,6 +1,6 @@
 # v2 — Continuous (gap-free) record/replay
 
-`v1` (`../t510_dma_loopback.c`, `../rx.c`, `../tx.c`) streams in fixed
+`v1` (`../t510_dma_stream.c`, `../rx.c`, `../tx.c`) streams in fixed
 2&nbsp;MB blocks: each block is a full one-shot RX capture or cyclic-TX
 playback, started and stopped with `IOC_START`/`IOC_STOP`. `IOC_STOP`
 terminates the DMA channel and sleeps 20&nbsp;ms before the channel can be
@@ -74,11 +74,11 @@ continues. `--loop` wraps the input file for indefinite playback.
 ## Binding / module loading
 
 `t510_dma_stream` matches the *same* device-tree node as
-`t510_dma_loopback` (`compatible = "antsdr,t510-dma-loopback"`, dma-names
+`t510_dma_stream` (`compatible = "antsdr,t510-dma-stream"`, dma-names
 `"tx"`/`"rx"`), so **only one of the two drivers can be bound at a time**:
 
 ```bash
-rmmod t510_dma_loopback 2>/dev/null
+rmmod t510_dma_stream 2>/dev/null
 insmod t510_dma_stream.ko          # optionally: num_periods=32 period_bytes=1048576
 ```
 
@@ -94,7 +94,7 @@ make -C v2/driver KDIR=/path/to/petalinux_proj/t510zcu47dr/build/tmp/work-shared
 
 (`v2/driver/t510_dma_stream.ko` is produced. Substitute the actual kernel
 source/build dir from the PetaLinux project, matching the `KDIR` used to
-build `t510_dma_loopback.ko`.)
+build `t510_dma_stream.ko`.)
 
 User-space apps (cross-compile):
 
@@ -109,8 +109,8 @@ make -C v2/app CC=aarch64-linux-gnu-gcc
 On the board, as root:
 
 ```bash
-# load the v2 driver (only one of t510_dma_loopback / t510_dma_stream at a time)
-rmmod t510_dma_loopback 2>/dev/null; insmod t510_dma_stream.ko
+# load the v2 driver (only one of t510_dma_stream / t510_dma_stream at a time)
+rmmod t510_dma_stream 2>/dev/null; insmod t510_dma_stream.ko
 
 # RFDC bring-up (per top-level README, must run twice)
 /home/rfdc-dma-app-main/t510_port-main/linux_app/t510_rf_init
@@ -161,7 +161,7 @@ existing tooling.)
 ## Sizing the ring vs. SSD throughput
 
 The RFDC RX path runs at a fixed hardware rate (see
-`../t510_dma_loopback.c` comments: ~983 MB/s for the current
+`../t510_dma_stream.c` comments: ~983 MB/s for the current
 decimation/sample-rate configuration). `num_periods * period_bytes /
 983 MB/s` is roughly how long the ring can buffer a transient SSD stall
 before an overrun (RX) or underrun (TX) occurs. The defaults (16 MiB per
@@ -217,7 +217,7 @@ throughput" above).
 
 ### Startup: possible stale data in the first RX period(s)
 
-`v1`'s driver (`t510_dma_loopback.c`) issued
+`v1`'s driver (`t510_dma_stream.c`) issued
 `T510_DMA_RX_FLUSH_PERIODS` (3) one-shot "flush" transfers before a real
 capture, to drain a backlog that can accumulate in the PL's
 `axis_data_fifo_2` while the RX DMA channel is idle. `v2`'s

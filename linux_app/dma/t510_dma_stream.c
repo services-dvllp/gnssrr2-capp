@@ -376,7 +376,7 @@ static int t510_dma_probe(struct platform_device *pdev)
 		goto err;
 
 	tdev->miscdev.minor = MISC_DYNAMIC_MINOR;
-	tdev->miscdev.name = "t510_dma_loopback";
+	tdev->miscdev.name = "t510_dma_stream";
 	tdev->miscdev.fops = &t510_dma_fops;
 	tdev->miscdev.parent = &pdev->dev;
 
@@ -413,7 +413,7 @@ static int t510_dma_remove(struct platform_device *pdev)
 }
 
 static const struct of_device_id t510_dma_of_match[] = {
-	{ .compatible = "antsdr,t510-dma-loopback" },
+	{ .compatible = "antsdr,t510-dma-stream" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, t510_dma_of_match);
@@ -422,7 +422,7 @@ static struct platform_driver t510_dma_driver = {
 	.probe = t510_dma_probe,
 	.remove = t510_dma_remove,
 	.driver = {
-		.name = "t510_dma_loopback",
+		.name = "t510_dma_stream",
 		.of_match_table = t510_dma_of_match,
 	},
 };
@@ -430,4 +430,4 @@ module_platform_driver(t510_dma_driver);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Susheel");
-MODULE_DESCRIPTION("ANTSDR T510 AXI DMA cyclic loopback helper");
+MODULE_DESCRIPTION("ANTSDR T510 AXI DMA cyclic stream helper");
