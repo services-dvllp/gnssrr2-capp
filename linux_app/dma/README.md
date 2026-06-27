@@ -3,7 +3,7 @@
 This folder adds the Linux data path for the T510 RFSoC loopback flow:
 
 - `t510_dma_stream.c`
-  Kernel module that requests the AXI DMA channels through Linux DMAEngine,
+  Kernel module source (built as `t510_dma_loopback.ko` by default for compatibility with existing deployment scripts) that requests the AXI DMA channels through Linux DMAEngine,
   allocates coherent TX/RX buffers, and starts interrupt-driven cyclic MM2S
   and S2MM transfers.
 - `t510_dma_tool.c`
@@ -55,7 +55,7 @@ make
 
 This builds:
 
-- `t510_dma_stream.ko`
+- `t510_dma_loopback.ko`
 - `t510_dma_tool`
 
 ## Load and run
@@ -70,7 +70,7 @@ cd /home/linux_proj/t510_port-main/linux_app
 Then in the DMA folder:
 
 ```sh
-insmod ./t510_dma_stream.ko
+insmod ./t510_dma_loopback.ko
 ./t510_dma_tool --capture-ms 1000 --csv -
 ```
 
