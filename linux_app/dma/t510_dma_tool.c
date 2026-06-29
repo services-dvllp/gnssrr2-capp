@@ -201,6 +201,16 @@ static FILE *open_csv(const char *path)
 
 static void csv_append(FILE *fp, const int16_t *buf, size_t nsamples)
 {
+    /*
+     * Preserve the DMA wire order in CSV.  The analysis/plotting script reads
+     * the two numeric CSV columns back into one flat int16 stream and then
+     * unpacks each 512-bit beat as reshape(n_beats, 8, 4):
+     *   path0 = ADC0 I, path1 = ADC0 Q, path2 = ADC1 I, path3 = ADC1 Q.
+     *
+     * Do not rearrange the samples here.  A previous change paired lanes into
+     * synthetic I/Q rows during CSV export, which corrupted the flat beat order
+     * and made the sine captures look distorted in the correct plot script.
+     */
     for (size_t i = 0; (i + 1) < nsamples; i += 2)
         fprintf(fp, "%d,%d\n", buf[i], buf[i + 1]);
 }
