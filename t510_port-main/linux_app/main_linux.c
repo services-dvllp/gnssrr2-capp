@@ -32,6 +32,10 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <getopt.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <string.h>
+#include <sys/mman.h>
 
 /* Activate metal logging so RFDC driver error/timeout messages are visible */
 #include "metal/log.h"
@@ -50,6 +54,51 @@ static void enable_metal_log(void)
  * RFDC device ID – same as XPAR_XRFDC_0_DEVICE_ID = 0 in the original
  * -------------------------------------------------------------------------- */
 #define RFDC_DEVICE_ID    XPAR_XRFDC_0_DEVICE_ID   /* 0 */
+
+/*
+ * Jun24 PL control GPIO at 0x8005_0000:
+ *   bit 4   -> axis_fir_bypass_mux_0/sel
+ *   bits 3:0 -> axis_4channel_interf_0/sel
+ * 0x10 selects the normal RFDC RX path with FIR/bypass mux enabled and keeps
+ * the counter/test selections out of the capture path.  Leaving this register
+ * at stale values such as 0x1f makes the first captures appear saturated or
+ * distorted until a manual `devmem 0x80050000 w 0x10` is issued.
+ */
+#define PL_CONTROL_GPIO_BASE  0x80050000UL
+#define PL_CONTROL_GPIO_VALUE 0x00000010U
+#define PL_CONTROL_GPIO_SPAN  0x1000UL
+
+static int write_pl_control_gpio(uint32_t value)
+{
+    int fd;
+    void *map;
+    volatile uint32_t *reg;
+
+    fd = open("/dev/mem", O_RDWR | O_SYNC);
+    if (fd < 0) {
+        fprintf(stderr, "open(/dev/mem) for PL control GPIO failed: %s\n",
+                strerror(errno));
+        return -1;
+    }
+
+    map = mmap(NULL, PL_CONTROL_GPIO_SPAN, PROT_READ | PROT_WRITE, MAP_SHARED,
+               fd, PL_CONTROL_GPIO_BASE);
+    if (map == MAP_FAILED) {
+        fprintf(stderr, "mmap PL control GPIO 0x%08lx failed: %s\n",
+                PL_CONTROL_GPIO_BASE, strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    reg = (volatile uint32_t *)map;
+    *reg = value;
+    printf("PL control GPIO 0x%08lx <= 0x%08x\n",
+           PL_CONTROL_GPIO_BASE, value);
+
+    munmap(map, PL_CONTROL_GPIO_SPAN);
+    close(fd);
+    return 0;
+}
 
 /* --------------------------------------------------------------------------
  * Global variables (same as original main.c)
@@ -168,6 +217,14 @@ int main(int argc, char *argv[])
     printf("DBG: calling RFdcDcp_initial\n"); fflush(stdout);
     RFdcDcp_initial(&RFdcInst, RFDC_DEVICE_ID);
     printf("DBG: RFdcDcp_initial done\n"); fflush(stdout);
+
+    if (write_pl_control_gpio(PL_CONTROL_GPIO_VALUE) != 0) {
+        fprintf(stderr,
+                "main: failed to set PL control GPIO to 0x%08x; aborting.\n"
+                "  This replaces the manual: devmem 0x80050000 w 0x10\n",
+                PL_CONTROL_GPIO_VALUE);
+        return EXIT_FAILURE;
+    }
 
     /* ------------------------------------------------------------------
      * 6. Reset all 4 ADC and 4 DAC tiles (as in the original)

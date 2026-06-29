@@ -202,23 +202,16 @@ static FILE *open_csv(const char *path)
 static void csv_append(FILE *fp, const int16_t *buf, size_t nsamples)
 {
     /*
-     * The Jun24 bitstream packs one 64-byte DMA beat as two 16-sample
-     * vectors: the first 16-bit lane group is I/time samples and the second
-     * group is Q/time samples.  Writing adjacent 16-bit words as I,Q makes
-     * the Q column advance twice as fast on the loopback sine capture.  Emit
-     * sixteen I/Q rows from each 32-word DMA beat instead.
+     * Preserve the DMA wire order in CSV.  The analysis/plotting script reads
+     * the two numeric CSV columns back into one flat int16 stream and then
+     * unpacks each 512-bit beat as reshape(n_beats, 8, 4):
+     *   path0 = ADC0 I, path1 = ADC0 Q, path2 = ADC1 I, path3 = ADC1 Q.
+     *
+     * Do not rearrange the samples here.  A previous change paired lanes into
+     * synthetic I/Q rows during CSV export, which corrupted the flat beat order
+     * and made the sine captures look distorted in the correct plot script.
      */
-    const size_t lanes_per_iq = 16;
-    const size_t words_per_beat = lanes_per_iq * 2;
-
-    size_t i = 0;
-    for (; i + words_per_beat <= nsamples; i += words_per_beat) {
-        for (size_t k = 0; k < lanes_per_iq; ++k)
-            fprintf(fp, "%d,%d\n", buf[i + k], buf[i + lanes_per_iq + k]);
-    }
-
-    /* Fallback for a short/truncated tail; should not occur for normal captures. */
-    for (; (i + 1) < nsamples; i += 2)
+    for (size_t i = 0; (i + 1) < nsamples; i += 2)
         fprintf(fp, "%d,%d\n", buf[i], buf[i + 1]);
 }
 

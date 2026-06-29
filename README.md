@@ -21,6 +21,8 @@ The current Jun24 hardware in `hw_info/` is the reference for this software:
 - RFDC decimation/interpolation: 40, giving 122.88 MSPS complex baseband.
 - RX backend: RFDC → channel/time-major conversion → FIR/bypass mux → optional
   programmable decimator → quantizer/packer → AXI DMA S2MM.
+- PL control GPIO `0x80050000` is initialized by `t510_rf_init` to `0x10`,
+  which selects the normal RFDC RX path and avoids stale counter/test settings.
 - TX backend: AXI DMA MM2S → unpacker → optional programmable interpolator →
   FIR → RFDC DAC formatter.
 
@@ -46,18 +48,18 @@ insmod ./t510_dma_loopback.ko
 
 ## Capture format
 
-A 2 ms capture is 1,966,080 bytes and 491,520 CSV rows plus the header.  The
-DMA payload is 16-bit little-endian signed data.  In the Jun24 backend a
-64-byte RX beat carries vectorized I samples followed by the corresponding Q
-samples; the tool therefore writes CSV rows as `I_Data,Q_Data` by pairing each
-I lane with the matching Q lane from the same beat.
+A 2 ms capture is 1,966,080 bytes and 491,520 CSV rows plus the header. The
+DMA payload is 16-bit little-endian signed data. CSV output intentionally keeps
+the raw DMA word order by writing adjacent 16-bit words as the two numeric
+columns; this keeps CSV and binary captures equivalent after the header is
+ignored.
 
-The older adjacent-word CSV interpretation made `Q_Data` look like it had twice
-the sine frequency of `I_Data`.  The counter capture in `outputs/` and the
-loopback sine capture are consistent with a packing/CSV interpretation issue,
-not an RFDC decimation mismatch.  The RFDC init app and generated RFDC config
-headers have been aligned to the Jun24 hardware decimation/interpolation factor
-of 40 for both active ADC and DAC slices.
+For plotting, read the CSV numbers back into one flat `int16` stream and unpack
+each 512-bit beat as `reshape(n_beats, 8, 4)`: path 0 is ADC0 I, path 1 is ADC0
+Q, path 2 is ADC1 I, and path 3 is ADC1 Q. Plotting the CSV columns directly as
+I/Q is misleading and is what made Q appear twice the I frequency. The RFDC init
+app and generated RFDC config headers remain aligned to the Jun24 hardware
+decimation/interpolation factor of 40 for both active ADC and DAC slices.
 
 ## Troubleshooting
 

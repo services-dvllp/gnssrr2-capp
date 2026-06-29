@@ -60,7 +60,7 @@ This builds:
 
 ## Load and run
 
-First bring up clocks/RFDC:
+First bring up clocks/RFDC. The init app also writes `0x10` to the Jun24 PL control GPIO at `0x80050000`, replacing the manual `devmem 0x80050000 w 0x10` step and selecting the normal RFDC RX path:
 
 ```sh
 cd /home/linux_proj/t510_port-main/linux_app
@@ -113,9 +113,11 @@ To save the RX capture instead of printing all samples:
 
 The Jun24 backend described in `hw_info/T510_designJun24.tcl` uses RFDC
 4.9152 GSPS with RFDC interpolation/decimation 40, so the complex baseband rate
-is 122.88 MSPS. The RX DMA beat is vector packed: I-lane samples and matching
-Q-lane samples are grouped inside each beat. The user tool writes CSV by
-pairing the matching vector lanes, not by treating adjacent raw 16-bit words as
-one IQ pair. The adjacent-word interpretation is what made the captured
-loopback sine look like `Q_freq = 2 * I_freq`; the RFDC Tx/Rx rate settings are
-both 40 in the Jun24 hardware and in the updated RFDC config headers.
+is 122.88 MSPS. The RX DMA beat is four-path vector data: reshape the flat
+int16 stream as `(n_beats, 8, 4)` to get ADC0 I, ADC0 Q, ADC1 I, and ADC1 Q.
+
+CSV output preserves the raw DMA word order by writing adjacent int16 words as
+the two numeric columns. This is deliberate: the plotting script reconstructs a
+flat int16 stream from those two columns before the `(8, 4)` beat unpack. Do not
+plot the CSV columns directly as I/Q; that direct-column interpretation is what
+made the loopback sine look like `Q_freq = 2 * I_freq`.
