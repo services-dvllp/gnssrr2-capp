@@ -108,3 +108,14 @@ To save the RX capture instead of printing all samples:
   same 8-sample block duplication style used by the bare-metal `format_tx_buffer()`.
 - If you want the exact original `iq_data_intr.h` waveform as the TX source, we
   can add a second step to import that table into the Linux tool.
+
+## Jun24 sample packing note
+
+The Jun24 backend described in `hw_info/T510_designJun24.tcl` uses RFDC
+4.9152 GSPS with RFDC interpolation/decimation 40, so the complex baseband rate
+is 122.88 MSPS. The RX DMA beat is vector packed: I-lane samples and matching
+Q-lane samples are grouped inside each beat. The user tool writes CSV by
+pairing the matching vector lanes, not by treating adjacent raw 16-bit words as
+one IQ pair. The adjacent-word interpretation is what made the captured
+loopback sine look like `Q_freq = 2 * I_freq`; the RFDC Tx/Rx rate settings are
+both 40 in the Jun24 hardware and in the updated RFDC config headers.

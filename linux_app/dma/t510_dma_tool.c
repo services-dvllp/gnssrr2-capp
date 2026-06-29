@@ -201,7 +201,24 @@ static FILE *open_csv(const char *path)
 
 static void csv_append(FILE *fp, const int16_t *buf, size_t nsamples)
 {
-    for (size_t i = 0; (i + 1) < nsamples; i += 2)
+    /*
+     * The Jun24 bitstream packs one 64-byte DMA beat as two 16-sample
+     * vectors: the first 16-bit lane group is I/time samples and the second
+     * group is Q/time samples.  Writing adjacent 16-bit words as I,Q makes
+     * the Q column advance twice as fast on the loopback sine capture.  Emit
+     * sixteen I/Q rows from each 32-word DMA beat instead.
+     */
+    const size_t lanes_per_iq = 16;
+    const size_t words_per_beat = lanes_per_iq * 2;
+
+    size_t i = 0;
+    for (; i + words_per_beat <= nsamples; i += words_per_beat) {
+        for (size_t k = 0; k < lanes_per_iq; ++k)
+            fprintf(fp, "%d,%d\n", buf[i + k], buf[i + lanes_per_iq + k]);
+    }
+
+    /* Fallback for a short/truncated tail; should not occur for normal captures. */
+    for (; (i + 1) < nsamples; i += 2)
         fprintf(fp, "%d,%d\n", buf[i], buf[i + 1]);
 }
 
