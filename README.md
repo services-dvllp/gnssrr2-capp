@@ -23,6 +23,15 @@ The current Jun24 hardware in `hw_info/` is the reference for this software:
   programmable decimator → quantizer/packer → AXI DMA S2MM.
 - PL control GPIO `0x80050000` is initialized by `t510_rf_init` to `0x10`,
   which selects the normal RFDC RX path and avoids stale counter/test settings.
+- RX/TX backend control blocks `0x80060000` (record_replay_ctrl_rx) and
+  `0x80070000` (record_replay_ctrl_tx) are initialized by `t510_rf_init` to the
+  documented capture format: 16-bit, dual-band, no extra PL decimation/
+  interpolation, unity quantiser/scale shift. These AXI-Lite register files
+  keep whatever the previous run wrote, so leaving them at a stale 8-bit
+  `BIT_MODE` makes the DMA tool read two packed 8-bit samples as one int16 word
+  — which is what made Q appear at twice the I frequency and stopped the I/Q
+  pair from looking orthogonal. Resetting them here makes every capture
+  deterministic regardless of prior PL state.
 - TX backend: AXI DMA MM2S → unpacker → optional programmable interpolator →
   FIR → RFDC DAC formatter.
 
@@ -49,17 +58,29 @@ insmod ./t510_dma_loopback.ko
 ## Capture format
 
 A 2 ms capture is 1,966,080 bytes and 491,520 CSV rows plus the header. The
-DMA payload is 16-bit little-endian signed data. CSV output intentionally keeps
-the raw DMA word order by writing adjacent 16-bit words as the two numeric
-columns; this keeps CSV and binary captures equivalent after the header is
-ignored.
+DMA payload is 16-bit little-endian signed data: one DMA frame is
+`I0, Q0, I1, Q1` (4 × int16 = 8 bytes), so a 2 ms capture is 245,760 frames.
+This 16-bit dual-band format only holds when the RX backend (`0x80060000`) is in
+`BIT_MODE = 0` — which `t510_rf_init` now programs explicitly (see above). CSV
+output intentionally keeps the raw DMA word order by writing adjacent 16-bit
+words as the two numeric columns; this keeps CSV and binary captures equivalent
+after the header is ignored.
 
 For plotting, read the CSV numbers back into one flat `int16` stream and unpack
-each 512-bit beat as `reshape(n_beats, 8, 4)`: path 0 is ADC0 I, path 1 is ADC0
-Q, path 2 is ADC1 I, and path 3 is ADC1 Q. Plotting the CSV columns directly as
-I/Q is misleading and is what made Q appear twice the I frequency. The RFDC init
-app and generated RFDC config headers remain aligned to the Jun24 hardware
-decimation/interpolation factor of 40 for both active ADC and DAC slices.
+every group of four `int16` as `[I0, Q0, I1, Q1]` (equivalently
+`reshape(n_frames, 4)`, or `reshape(n_beats, 8, 4)` since a 512-bit beat holds 8
+frames): column 0 is ADC0 I, column 1 is ADC0 Q, column 2 is ADC1 I, and column
+3 is ADC1 Q.
+
+Earlier captures showed Q at twice the I frequency and a non-orthogonal I/Q
+pair. The root cause was not plotting but format: the RX quantiser was left in
+8-bit `BIT_MODE` by a previous run, so the DMA stream carried 4 × int8 per frame
+and reading it as int16 spliced an I byte and a Q byte into each word. The
+counter test (`devmem 0x80050000 w 0x1F`) confirms this — its known per-channel
+ramps decode cleanly only as 8-bit, with the 256/512/1024 channel offsets
+appearing as 4/8/16 after the stale `QUANT_SHIFT = 6`. `t510_rf_init` now resets
+the RX/TX backends to 16-bit, so the documented unpacking is correct and I/Q
+match in frequency and quadrature.
 
 ## Troubleshooting
 

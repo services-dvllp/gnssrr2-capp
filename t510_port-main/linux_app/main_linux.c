@@ -101,6 +101,116 @@ static int write_pl_control_gpio(uint32_t value)
 }
 
 /* --------------------------------------------------------------------------
+ * Jun24 record/replay backend control blocks (AXI-Lite register files):
+ *   RX (record_replay_ctrl_rx) @ 0x8006_0000  -> programmable_decim,
+ *                                                iq_quantizer_vec, iq_bit_packer
+ *   TX (record_replay_ctrl_tx) @ 0x8007_0000  -> iq_bit_unpacker_tx,
+ *                                                programmable_interp_tx,
+ *                                                iq_requant_tx, iq_tx_formatter
+ *
+ * These two blocks decide the on-the-wire DMA sample format.  Like the
+ * 0x8005_0000 GPIO they POWER UP / reset to a known-good default, but the
+ * silicon keeps whatever a *previous* run (or a stray devmem) last wrote until
+ * the PL is reloaded.  t510_rf_init previously only reset the GPIO, so a stale
+ * BIT_MODE/QUANT_SHIFT left over from the record/replay firmware would survive
+ * into a fresh capture.
+ *
+ * The DMA capture tool and CSV/bin format are defined for 16-bit dual-band,
+ * undecimated samples: one DMA frame = I0,Q0,I1,Q1 = 4 x int16 = 8 bytes
+ * (Output_Width 16, Number_Paths 4).  If the RX quantiser is left in 8-bit
+ * mode it emits 4 x int8 = 4 bytes per frame instead; the tool then reads two
+ * packed 8-bit samples as one int16 word, which splices an I byte and a Q byte
+ * together.  That is exactly what makes Q appear at twice the frequency of I
+ * and stops the I/Q pair looking orthogonal.  A stale TX BIT_MODE corrupts the
+ * unpacker the same way, so the looped-back tone no longer tracks the
+ * transmitted waveform.
+ *
+ * Programming both blocks to the documented 16-bit, dual-band, no-extra-decim,
+ * unity-shift configuration makes the capture deterministic and matches the
+ * tool/README contract regardless of prior PL state.  Register offsets and
+ * bit positions are taken directly from sdr2cl/sdr2/hdl/record_replay_ctrl_*.v.
+ * -------------------------------------------------------------------------- */
+#define RR_CTRL_SPAN          0x1000UL
+
+#define RR_RX_CTRL_BASE       0x80060000UL
+#define RR_TX_CTRL_BASE       0x80070000UL
+
+/* Register offsets common to both RX and TX control blocks */
+#define RR_REG_CTRL           0x000U   /* [2]=SOFT_RESET [4]=COUNT_CLR */
+#define RR_REG_BAND_MODE      0x008U   /* [1]=BAND_DUAL (1=dual, 0=single) */
+#define RR_REG_RATE_M         0x050U   /* RX: DECIM_M     TX: INTERP_M   */
+#define RR_REG_RATE_PHASE     0x054U   /* RX: DECIM_PHASE TX: INTERP_PHASE */
+#define RR_REG_BIT_MODE       0x070U   /* [1:0] 00=16-bit 01=8-bit 10=4-bit 11=2-bit */
+#define RR_REG_SHIFT          0x074U   /* RX: QUANT_SHIFT TX: SCALE_SHIFT */
+
+#define RR_CTRL_SOFT_RESET    (1U << 2)
+#define RR_CTRL_COUNT_CLR     (1U << 4)
+
+/* TX-only register: iq_requant_tx clip limit (0x078, [13:0]); HDL default. */
+#define RR_TX_REG_LIMIT       0x078U
+#define RR_TX_LIMIT_DEFAULT   8192U
+
+#define RR_BAND_DUAL          0x2U     /* band_mode bit1 set -> dual-band */
+#define RR_BIT_MODE_16        0x0U     /* 16-bit pass-through quantiser   */
+#define RR_RATE_NONE          0x1U     /* M=1 -> no extra PL decim/interp */
+
+static int reset_rr_ctrl_block(const char *name, unsigned long base, int is_tx)
+{
+    int fd;
+    void *map;
+    volatile uint8_t *regs;
+
+    fd = open("/dev/mem", O_RDWR | O_SYNC);
+    if (fd < 0) {
+        fprintf(stderr, "open(/dev/mem) for %s control block failed: %s\n",
+                name, strerror(errno));
+        return -1;
+    }
+
+    map = mmap(NULL, RR_CTRL_SPAN, PROT_READ | PROT_WRITE, MAP_SHARED, fd, base);
+    if (map == MAP_FAILED) {
+        fprintf(stderr, "mmap %s control block 0x%08lx failed: %s\n",
+                name, base, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    regs = (volatile uint8_t *)map;
+
+#define RR_WR(off, val) (*(volatile uint32_t *)(regs + (off)) = (uint32_t)(val))
+
+    /* Format/rate first, then flush the datapath so the new settings take
+     * effect on clean pipeline state. */
+    RR_WR(RR_REG_BAND_MODE, RR_BAND_DUAL);
+    RR_WR(RR_REG_RATE_M,    RR_RATE_NONE);
+    RR_WR(RR_REG_RATE_PHASE, 0U);
+    RR_WR(RR_REG_BIT_MODE,  RR_BIT_MODE_16);
+    RR_WR(RR_REG_SHIFT,     0U);
+    if (is_tx)
+        RR_WR(RR_TX_REG_LIMIT, RR_TX_LIMIT_DEFAULT);  /* avoid a stale TX clip */
+    /* SOFT_RESET (self-clearing 32-cycle pulse) + COUNT_CLR */
+    RR_WR(RR_REG_CTRL, RR_CTRL_SOFT_RESET | RR_CTRL_COUNT_CLR);
+    RR_WR(RR_REG_CTRL, 0U);
+
+#undef RR_WR
+
+    printf("%s backend 0x%08lx <= 16-bit dual-band, M=1, shift=0 (soft reset)\n",
+           name, base);
+
+    munmap(map, RR_CTRL_SPAN);
+    close(fd);
+    return 0;
+}
+
+/* Reset both record/replay control blocks to the documented 16-bit format. */
+static int init_record_replay_backend(void)
+{
+    int rc = 0;
+    rc |= reset_rr_ctrl_block("RX", RR_RX_CTRL_BASE, 0);
+    rc |= reset_rr_ctrl_block("TX", RR_TX_CTRL_BASE, 1);
+    return rc;
+}
+
+/* --------------------------------------------------------------------------
  * Global variables (same as original main.c)
  * -------------------------------------------------------------------------- */
 XRFdc  RFdcInst;
@@ -223,6 +333,19 @@ int main(int argc, char *argv[])
                 "main: failed to set PL control GPIO to 0x%08x; aborting.\n"
                 "  This replaces the manual: devmem 0x80050000 w 0x10\n",
                 PL_CONTROL_GPIO_VALUE);
+        return EXIT_FAILURE;
+    }
+
+    /* Reset the RX (0x80060000) and TX (0x80070000) record/replay backend
+     * control blocks to the documented 16-bit dual-band format.  Without this
+     * a stale BIT_MODE/QUANT_SHIFT (e.g. an 8-bit configuration left by the
+     * record/replay firmware) makes the DMA tool misread packed 8-bit samples
+     * as 16-bit words, scrambling the I/Q pair (Q appears at 2x the I
+     * frequency and the pair is no longer orthogonal). */
+    if (init_record_replay_backend() != 0) {
+        fprintf(stderr,
+                "main: failed to program record/replay backend control blocks;\n"
+                "  captures may be in a stale (e.g. 8-bit) format. Aborting.\n");
         return EXIT_FAILURE;
     }
 
