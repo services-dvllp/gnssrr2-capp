@@ -41,21 +41,25 @@
 #define STALL_TIMEOUT_MS     5000.0
 
 
-#if 0
-static const int16_t BaseIqData[] = {
-include "iq_data_intr.h"
-};
+#define TX_SIGNAL_SINE_1P76M 0
+#define TX_SIGNAL_SINE_1M    1
+
+#ifndef TX_SIGNAL_SELECT
+#define TX_SIGNAL_SELECT TX_SIGNAL_SINE_1P76M
+#endif
+
+#if TX_SIGNAL_SELECT == TX_SIGNAL_SINE_1P76M
+#include "sin_iq_1p76M.h"
+#define TX_SIGNAL_DATA sin_iq_1p76M
+#elif TX_SIGNAL_SELECT == TX_SIGNAL_SINE_1M
+#include "sin_iq_1M.h"
+#define TX_SIGNAL_DATA sin_iq_1M
+#else
+#error "Unsupported TX_SIGNAL_SELECT value"
+#endif
 
 #define UNIQUE_SAMPLES \
-    (sizeof(BaseIqData) / sizeof(BaseIqData[0]))
-	
-#else
-	#include "sin_iq_1p76M.h"
-	//static const int16_t BaseIqData[];
-	//BaseIqData = &sin_iq_1p76M[0];
-	#define UNIQUE_SAMPLES \
-		(sizeof(sin_iq_1p76M) / sizeof(sin_iq_1p76M[0]))	
-#endif
+    (sizeof(TX_SIGNAL_DATA) / sizeof(TX_SIGNAL_DATA[0]))
 
 
 
@@ -109,10 +113,9 @@ static void format_tx_buffer_exact(int16_t *tx_buf)
 
     /*
      * Fill the whole cyclic TX ring (T510_DMA_TOTAL_SAMPLES), wrapping the
-     * tone table as needed.  The table holds 122,880 IQ pairs = exactly
-     * 1500 cycles of the 1.5 MHz tone at 122.88 MSPS, and the per-DAC ring
-     * length (262,144 pairs) is an exact multiple of the tone period, so
-     * both the table wrap and the cyclic buffer wrap are phase-continuous.
+     * selected tone table as needed.  Each table holds 122,880 IQ pairs at
+     * 122.88 MSPS, so the table wrap is phase-continuous for the available
+     * integer-cycle tones.
      * Stopping at the end of the table instead would leave 53% of the ring
      * zero-filled and transmit 1 ms of tone followed by 1.13 ms of silence.
      */
@@ -121,14 +124,14 @@ static void format_tx_buffer_exact(int16_t *tx_buf)
         /* First 8 samples (DAC stream 0, tdata[127:0]) */
         for (int i = 0; i < 8; i++) {
             //tx_buf[dst_idx++] = BaseIqData[src_idx + i]/1;
-			tx_buf[dst_idx++] = sin_iq_1p76M[src_idx + i]/1;			
+			tx_buf[dst_idx++] = TX_SIGNAL_DATA[src_idx + i]/1;			
 			//tx_buf[dst_idx++] = count++;
         }
 
         /* Duplicate same 8 samples (DAC stream 1, tdata[255:128]) */
         for (int i = 0; i < 8; i++) {
             //tx_buf[dst_idx++] = BaseIqData[src_idx + i]/1;
-			tx_buf[dst_idx++] = sin_iq_1p76M[src_idx + i]/1;
+			tx_buf[dst_idx++] = TX_SIGNAL_DATA[src_idx + i]/1;
 			//tx_buf[dst_idx++] =-(500+count++);
         }
 
