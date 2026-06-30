@@ -138,10 +138,38 @@ static int write_pl_control_gpio(uint32_t value)
 /* Register offsets common to both RX and TX control blocks */
 #define RR_REG_CTRL           0x000U   /* [2]=SOFT_RESET [4]=COUNT_CLR */
 #define RR_REG_BAND_MODE      0x008U   /* [1]=BAND_DUAL (1=dual, 0=single) */
+#define RR_REG_FIR_COEFF_ADDR 0x030U   /* [5:0] shadow-RAM write pointer */
+#define RR_REG_FIR_COEFF_DATA 0x034U   /* [19:0] coeff @ADDR; auto-increments */
+#define RR_REG_FIR_COEFF_CTRL 0x038U   /* [0]=START reload [3]=AUTO_INCR (rst=1) */
 #define RR_REG_RATE_M         0x050U   /* RX: DECIM_M     TX: INTERP_M   */
 #define RR_REG_RATE_PHASE     0x054U   /* RX: DECIM_PHASE TX: INTERP_PHASE */
 #define RR_REG_BIT_MODE       0x070U   /* [1:0] 00=16-bit 01=8-bit 10=4-bit 11=2-bit */
 #define RR_REG_SHIFT          0x074U   /* RX: QUANT_SHIFT TX: SCALE_SHIFT */
+
+/*
+ * fir_compiler_rx/tx are generated (T510_designJun24.tcl) with a *placeholder*
+ * 31-tap reloadable coefficient vector {0..0,-1,2,-1,0..0}.  That kernel is a
+ * discrete Laplacian: its DC gain is 0 and it attenuates a 1.76 MHz baseband
+ * tone by ~48 dB and a 1.0 MHz tone by ~58 dB (it is a high-pass).  The RX FIR
+ * is bypassed by the 0x80050000 bit4 mux, so RX/counter captures are fine; the
+ * TX FIR has NO bypass, so with the placeholder coefficients the DAC baseband
+ * is nulled and the loopback shows only the DAC carrier - no transmitted tone,
+ * identical for every TX_SIGNAL_SELECT.  These blocks expose the FIR coefficient
+ * shadow RAM + reload FSM (M_AXIS_RELOAD -> fir_compiler S_AXIS_RELOAD) but
+ * nothing ever loaded real coefficients.  We load an identity (pass-through)
+ * kernel here so the FIR is flat unity gain and the baseband tone survives.
+ *
+ * Coefficients are signed integers (Coefficient_Fractional_Bits=0).  The IP
+ * sizes its full-precision output from the compile-time |coeff| sum (=4 ->
+ * 2 bits of growth) and Output_Width=16 keeps the MSBs, i.e. it divides by 4.
+ * A single centre tap of 4 therefore gives unity pass-band gain; a full-scale
+ * +/-8191 tone stays at +/-8191, just under the iq_requant LIMIT (8192), so it
+ * passes without clipping.  (If a capture comes out low, raise RR_FIR_UNITY;
+ * if iq_requant clip_count climbs, lower it.)
+ */
+#define RR_FIR_NUM_TAPS       31U
+#define RR_FIR_CENTER_TAP     15U      /* centre of a 31-tap filter */
+#define RR_FIR_UNITY          4U       /* integer coeff giving unity output */
 
 #define RR_CTRL_SOFT_RESET    (1U << 2)
 #define RR_CTRL_COUNT_CLR     (1U << 4)
@@ -187,13 +215,29 @@ static int reset_rr_ctrl_block(const char *name, unsigned long base, int is_tx)
     RR_WR(RR_REG_SHIFT,     0U);
     if (is_tx)
         RR_WR(RR_TX_REG_LIMIT, RR_TX_LIMIT_DEFAULT);  /* avoid a stale TX clip */
+
+    /*
+     * Load an identity (pass-through) coefficient set into the FIR shadow RAM
+     * and trigger a reload, replacing the {-1,2,-1} placeholder that nulls the
+     * baseband.  Force AUTO_INCR (bit3) on, set ADDR=0 once, then stream all
+     * 31 taps; only the centre tap is non-zero.
+     */
+    RR_WR(RR_REG_FIR_COEFF_CTRL, 0x8U);   /* AUTO_INCR=1, START=0 */
+    RR_WR(RR_REG_FIR_COEFF_ADDR, 0U);
+    for (unsigned tap = 0; tap < RR_FIR_NUM_TAPS; ++tap)
+        RR_WR(RR_REG_FIR_COEFF_DATA,
+              (tap == RR_FIR_CENTER_TAP) ? RR_FIR_UNITY : 0U);
+    /* START reload (bit0) while keeping AUTO_INCR (bit3) set. */
+    RR_WR(RR_REG_FIR_COEFF_CTRL, 0x9U);
+    usleep(1000);  /* let the 31-beat reload stream complete before continuing */
+
     /* SOFT_RESET (self-clearing 32-cycle pulse) + COUNT_CLR */
     RR_WR(RR_REG_CTRL, RR_CTRL_SOFT_RESET | RR_CTRL_COUNT_CLR);
     RR_WR(RR_REG_CTRL, 0U);
 
 #undef RR_WR
 
-    printf("%s backend 0x%08lx <= 16-bit dual-band, M=1, shift=0 (soft reset)\n",
+    printf("%s backend 0x%08lx <= 16-bit dual-band, M=1, shift=0, identity FIR (soft reset)\n",
            name, base);
 
     munmap(map, RR_CTRL_SPAN);
@@ -398,8 +442,22 @@ int main(int argc, char *argv[])
      *    Mixer_DAC_NCO_Freq = 1500 MHz
      *    If 1500e6 < DAC_FS/2 → Nyquist zone 1 (first),  freq positive
      *    Else                  → Nyquist zone 2 (second), freq negated
+     *
+     *    The DAC up-conversion NCO MUST use the same magnitude as the ADC
+     *    down-conversion NCO (step 10, 1500 MHz).  In a TX→RX loopback the
+     *    recovered baseband frequency is f_table + (f_DAC_NCO - f_ADC_NCO):
+     *    any DAC/ADC NCO mismatch shifts every captured tone by that
+     *    difference AND leaves the DAC carrier/LO feed-through as a strong
+     *    spur at exactly (f_DAC_NCO - f_ADC_NCO).
+     *
+     *    The previous values (1501.2 MHz + a per-block "+Block_Id" offset,
+     *    i.e. 1501.2/1502.2 MHz) against the 1500 MHz ADC NCO produced
+     *    exactly the +1.2 MHz and +2.2 MHz carrier spurs seen in every
+     *    loopback capture, independent of the transmitted tone.  Matching
+     *    the DAC NCO to 1500 MHz on every block puts that carrier at DC and
+     *    recovers the transmitted tone at its true baseband frequency.
      * ------------------------------------------------------------------ */
-    Mixer_DAC_NCO_Freq = 1501.2;
+    Mixer_DAC_NCO_Freq = 1500.0;
     if (Mixer_DAC_NCO_Freq * 1e6 < (double)DAC_FS / 2.0)
         dac_nco_nyquist = 1;
     else {
@@ -413,8 +471,9 @@ int main(int argc, char *argv[])
             if (Status != XST_SUCCESS)
                 printf("Tile_Id=%d,Block_Id=%d,XRFdc_SetNyquistZone fail\n",
                        Tile_Id, Block_Id * 2);
+            /* Same NCO on every DAC block: no per-block offset, matches ADC. */
             Status = XRFdc_ConfigMixer(&RFdcInst, XRFDC_DAC_TILE, Tile_Id,
-                                       Block_Id * 2, (Mixer_DAC_NCO_Freq+Block_Id));
+                                       Block_Id * 2, Mixer_DAC_NCO_Freq);
             if (Status != XST_SUCCESS)
                 printf("Tile_Id=%d,Block_Id=%d,XRFdc_ConfigMixer fail\n",
                        Tile_Id, Block_Id);
