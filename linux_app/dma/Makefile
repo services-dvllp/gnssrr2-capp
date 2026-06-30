@@ -25,7 +25,7 @@ unload:
 	-rmmod $(MODULE_NAME)
 	-rmmod t510_dma_stream
 
-t510_dma_tool: t510_dma_tool.c t510_dma_ioctl.h
+t510_dma_tool: t510_dma_tool.c t510_dma_ioctl.h sin_iq_1p76M.h sin_iq_1M.h
 	$(CC) $(CFLAGS_USER) -o $@ t510_dma_tool.c $(LDFLAGS_USER)
 
 clean:
