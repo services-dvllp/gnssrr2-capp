@@ -35,6 +35,26 @@ u32 XRFdc_ConfigMixer(XRFdc *RFdcInstPtr, u32 Type, u32 Tile_Id, u32 Block_Id,do
 	Mixer_Settings.EventSource = XRFDC_EVNT_SRC_TILE;
 	//����NCO��Ƶ��
 	Mixer_Settings.Freq = Freq_set; //unit is MHz
+	/*
+	 * Force the architecturally-correct fine-mixer mode on every call.
+	 *
+	 * The T510 RX/TX chain needs:  real ADC sample  -> complex IQ baseband
+	 * (R2C) on the ADC, and complex IQ baseband -> real DAC output (C2R) on
+	 * the DAC.  Previously ConfigMixer only set Freq/EventSource and preserved
+	 * whatever XRFdc_GetMixerSettings() read back, so the mode was left at the
+	 * reset/bitstream default.  The only other place these modes are written is
+	 * inside XRFdc_MTS_SYNC(), which is either skipped (--skip-mts) or aborts at
+	 * DAC sync before reaching the mixer-mode block on the single-tile
+	 * bring-up.  As a result the Tx/Rx mixers were never guaranteed to be in the
+	 * correct complex<->real mode.  Set them explicitly here (same modes the MTS
+	 * path uses) so the configuration is correct independent of MTS.
+	 */
+	Mixer_Settings.MixerType = XRFDC_MIXER_TYPE_FINE;
+	if (Type == XRFDC_ADC_TILE) {
+		Mixer_Settings.MixerMode = XRFDC_MIXER_MODE_R2C;
+	} else {
+		Mixer_Settings.MixerMode = XRFDC_MIXER_MODE_C2R;
+	}
 	//����Mixer
 	Status|=XRFdc_SetMixerSettings (RFdcInstPtr, Type, Tile_Id, Block_Id,&Mixer_Settings);
 	//��λNCOPhase
