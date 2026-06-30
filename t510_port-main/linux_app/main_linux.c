@@ -566,6 +566,31 @@ int main(int argc, char *argv[])
         }
     }
 
+    /* ------------------------------------------------------------------
+     * 14. Restart the converter datapath FIFOs (last, after all config).
+     *
+     *     The DAC reads the PL TX AXI-Stream through its datapath FIFO.  The
+     *     interpolation/decimation factors were changed in step 11 AFTER the
+     *     tile resets, and the canonical Xilinx bring-up restarts the FIFO
+     *     once the datapath rate is final (disable, then enable) so the FIFO
+     *     read pointer re-syncs to the new rate.  Without this the DAC FIFO
+     *     can stay stalled and never drain the PL stream: the AXI-DMA MM2S
+     *     back-pressures (tx_periods stays 0) and the DAC plays only its
+     *     mixer carrier, so a loopback shows a pure DC term and no tone even
+     *     though the TX ring is correct.  Toggling both ADC and DAC FIFOs is
+     *     harmless to the (working) RX path, which is started later.
+     * ------------------------------------------------------------------ */
+    for (Tile_Id = 0; Tile_Id < num_tiles; Tile_Id++) {
+        XRFdc_SetupFIFO(&RFdcInst, XRFDC_DAC_TILE, (int)Tile_Id, 0U);
+        XRFdc_SetupFIFO(&RFdcInst, XRFDC_ADC_TILE, (int)Tile_Id, 0U);
+    }
+    for (Tile_Id = 0; Tile_Id < num_tiles; Tile_Id++) {
+        Status  = XRFdc_SetupFIFO(&RFdcInst, XRFDC_DAC_TILE, (int)Tile_Id, 1U);
+        Status |= XRFdc_SetupFIFO(&RFdcInst, XRFDC_ADC_TILE, (int)Tile_Id, 1U);
+        printf("Tile#%u converter FIFOs restarted (DAC+ADC), Status=%u\n",
+               Tile_Id, Status);
+    }
+
     printf("**************************************************\n");
     printf("********antsdr T510 CH8 standalone test finsh!*********\n");
     printf("**************************************************\n");
