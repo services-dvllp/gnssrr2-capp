@@ -108,34 +108,38 @@ static void format_tx_buffer_from_generated_tone(int16_t *tx_buf)
 
 static void format_tx_buffer_exact(int16_t *tx_buf)
 {
-    size_t src_idx = 0;
     size_t dst_idx = 0;
+    size_t sample  = 0;                      /* complex-sample index in table */
+    const size_t num_samples = UNIQUE_SAMPLES / 2U;
 
     /*
      * Fill the whole cyclic TX ring (T510_DMA_TOTAL_SAMPLES), wrapping the
      * selected tone table as needed.  Each table holds 122,880 IQ pairs at
-     * 122.88 MSPS, so the table wrap is phase-continuous for the available
-     * integer-cycle tones.
-     * Stopping at the end of the table instead would leave 53% of the ring
-     * zero-filled and transmit 1 ms of tone followed by 1.13 ms of silence.
+     * 122.88 MSPS (an integer number of cycles), so the wrap is
+     * phase-continuous and the ring transmits a gap-free tone.
+     *
+     * Wire format: iq_bit_unpacker_tx in dual-band 16-bit mode (BAND_DUAL=1,
+     * BIT_MODE=00) reads each 256-bit beat as 4 TIME-MAJOR steps, and within
+     * a step the four 16-bit lanes are I0,Q0,I1,Q1 - band0 I/Q then band1 I/Q
+     * (sdr2cl/sdr2/hdl/iq_bit_unpacker_tx.v, dual-16 case).  So each step must
+     * be {I,Q,I,Q} for one complex sample, advancing ONE complex sample per
+     * step.  This loopback drives the same tone onto both DAC bands.
+     *
+     * The earlier channel-major layout (8 contiguous band0 samples then 8
+     * duplicated band1 samples) does NOT match this time-major unpacker: it
+     * makes band0 receive only the even-indexed table samples and band1 the
+     * odd-indexed ones, scrambling the per-band tone.
      */
-    while (dst_idx < T510_DMA_TOTAL_SAMPLES) {
+    while (dst_idx + 4U <= T510_DMA_TOTAL_SAMPLES) {
+        int16_t i_samp = TX_SIGNAL_DATA[sample * 2U];
+        int16_t q_samp = TX_SIGNAL_DATA[sample * 2U + 1U];
 
-        /* First 8 samples (DAC stream 0, tdata[127:0]) */
-        for (int i = 0; i < 8; i++) {
-            //tx_buf[dst_idx++] = BaseIqData[src_idx + i]/1;
-			tx_buf[dst_idx++] = TX_SIGNAL_DATA[src_idx + i]/1;			
-			//tx_buf[dst_idx++] = count++;
-        }
+        tx_buf[dst_idx++] = i_samp;   /* step lane 0: band0 I */
+        tx_buf[dst_idx++] = q_samp;   /* step lane 1: band0 Q */
+        tx_buf[dst_idx++] = i_samp;   /* step lane 2: band1 I (same tone) */
+        tx_buf[dst_idx++] = q_samp;   /* step lane 3: band1 Q */
 
-        /* Duplicate same 8 samples (DAC stream 1, tdata[255:128]) */
-        for (int i = 0; i < 8; i++) {
-            //tx_buf[dst_idx++] = BaseIqData[src_idx + i]/1;
-			tx_buf[dst_idx++] = TX_SIGNAL_DATA[src_idx + i]/1;
-			//tx_buf[dst_idx++] =-(500+count++);
-        }
-
-        src_idx = (src_idx + 8) % UNIQUE_SAMPLES;
+        sample = (sample + 1U) % num_samples;
     }
 }
 
