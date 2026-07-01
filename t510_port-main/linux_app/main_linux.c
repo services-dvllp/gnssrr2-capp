@@ -169,7 +169,14 @@ static int write_pl_control_gpio(uint32_t value)
  */
 #define RR_FIR_NUM_TAPS       31U
 #define RR_FIR_CENTER_TAP     15U      /* centre of a 31-tap filter */
-#define RR_FIR_UNITY          4U       /* integer coeff giving unity output */
+/*
+ * Unity-gain centre tap.  On hardware, a centre tap of 4 drove iq_requant_tx
+ * clip_count to ~4x the beat count (every sample clipped), so the FIR output
+ * window keeps the low bits (gain == coeff), not the /4 that the compile-time
+ * |coeff| growth suggested.  A centre tap of 1 makes the FIR pass a full-scale
+ * +/-8191 tone through unchanged, just under the requant LIMIT (8192).
+ */
+#define RR_FIR_UNITY          1U
 
 #define RR_CTRL_SOFT_RESET    (1U << 2)
 #define RR_CTRL_COUNT_CLR     (1U << 4)
