@@ -1,0 +1,13 @@
+vhdl xil_defaultlib  \
+"../../../bd/T510_design/ip/T510_design_rst_ps8_0_99M_0/sim/T510_design_rst_ps8_0_99M_0.vhd" \
+"../../../bd/T510_design/ip/T510_design_axi_dma_0_0/sim/T510_design_axi_dma_0_0.vhd" \
+"../../../bd/T510_design/ip/T510_design_rst_clk_wiz_0_61M_0/sim/T510_design_rst_clk_wiz_0_61M_0.vhd" \
+"../../../bd/T510_design/ip/T510_design_rst_T510_design_15M_0/sim/T510_design_rst_T510_design_15M_0.vhd" \
+"../../../bd/T510_design/ip/T510_design_rst_T510_design_30M_0/sim/T510_design_rst_T510_design_30M_0.vhd" \
+"../../../bd/T510_design/ip/T510_design_axi_gpio_0_0/sim/T510_design_axi_gpio_0_0.vhd" \
+"../../../bd/T510_design/ip/T510_design_axi_bram_ctrl_0_0/sim/T510_design_axi_bram_ctrl_0_0.vhd" \
+"../../../bd/T510_design/ip/T510_design_fir_compiler_rx_0/sim/T510_design_fir_compiler_rx_0.vhd" \
+"../../../bd/T510_design/ip/T510_design_fir_compiler_tx_0/sim/T510_design_fir_compiler_tx_0.vhd" \
+
+# Do not sort compile order
+nosort
