@@ -53,13 +53,12 @@ The current Jun24 hardware in `hw_info/` is the reference for this software:
 cd /home/gnssrr2-capp-main/t510_port-main/linux_app/
 make clean && make -j4
 
-rmmod t510_dma_loopback 2>/dev/null || true
 rmmod t510_dma_stream 2>/dev/null || true
 
 cd /home/gnssrr2-capp-main/linux_app/dma
 make clean && make ARCH=arm64
 
-insmod ./t510_dma_loopback.ko
+insmod ./t510_dma_stream.ko
 
 /home/gnssrr2-capp-main/t510_port-main/linux_app/t510_rf_init
 /home/gnssrr2-capp-main/linux_app/dma/t510_dma_tool \
@@ -113,7 +112,7 @@ With all three fixed, both channels show the transmitted tone at 1.76 MHz (or
 ## Troubleshooting
 
 - If `/dev/t510_dma_stream` is missing, check that the device tree contains the
-  `antsdr,t510-dma-stream` node and that `insmod ./t510_dma_loopback.ko`
+  `antsdr,t510-dma-stream` node and that `insmod ./t510_dma_stream.ko`
   succeeded.
 - If `t510_rf_init` fails before touching RFDC, check `/dev/spidev1.0` and the
   `zynqmp_gpio` sysfs GPIO chip.

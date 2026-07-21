@@ -1,5 +1,5 @@
 ifneq ($(KERNELRELEASE),)
-MODULE_NAME ?= t510_dma_loopback
+MODULE_NAME ?= t510_dma_stream
 obj-m := $(MODULE_NAME).o
 ifneq ($(MODULE_NAME),t510_dma_stream)
 $(MODULE_NAME)-y := t510_dma_stream.o
@@ -10,7 +10,7 @@ PWD  := $(shell pwd)
 CC   ?= gcc
 CFLAGS_USER := -O2 -Wall -Wextra -std=gnu11
 LDFLAGS_USER := -lm
-MODULE_NAME ?= t510_dma_loopback
+MODULE_NAME ?= t510_dma_stream
 
 .PHONY: all module user unload clean
 

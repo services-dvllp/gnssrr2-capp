@@ -19,7 +19,7 @@ CFLAGS  ?= -O2 -Wall -Wextra -std=gnu11
 
 # Kernel build tree for the module. Default is the standard location populated
 # by the kernel-headers package (same default the v1/v2 driver Makefiles use,
-# and the one the board already builds t510_dma_loopback against). Override on
+# and the one the board already builds t510_dma_stream against). Override on
 # the command line only if your kernel source lives elsewhere.
 KDIR    ?= /lib/modules/$(shell uname -r)/build
 
