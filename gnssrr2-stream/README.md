@@ -55,7 +55,7 @@ make
 
 The kernel module is built against `KDIR`, which defaults to
 `/lib/modules/$(uname -r)/build` — the same standard location the existing
-`t510_dma_loopback` driver builds against on this board, so no path needs to be
+`t510_dma_stream` driver builds against on this board, so no path needs to be
 passed. Override it only if your kernel source tree lives elsewhere:
 
 ```bash
@@ -73,11 +73,10 @@ make clean                      # remove all build artifacts
 
 ## Load the driver (once per boot)
 
-`t510_dma_stream` binds the same device-tree node as `t510_dma_loopback`, so
-only one may be loaded at a time:
+`t510_dma_stream` binds the `antsdr,t510-dma-stream` device-tree node:
 
 ```bash
-rmmod t510_dma_loopback 2>/dev/null
+rmmod t510_dma_stream 2>/dev/null
 insmod build/t510_dma_stream.ko           # default: num_periods=64 period_bytes=1048576 (64 MiB/ring)
                                           # override e.g.: insmod ... num_periods=128
 # /dev/t510_dma_stream now exists

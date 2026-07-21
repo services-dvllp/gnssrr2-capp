@@ -3,7 +3,7 @@
 This folder adds the Linux data path for the T510 RFSoC loopback flow:
 
 - `t510_dma_stream.c`
-  Kernel module source (built as `t510_dma_loopback.ko` by default for compatibility with existing deployment scripts) that requests the AXI DMA channels through Linux DMAEngine,
+  Kernel module source (built as `t510_dma_stream.ko` by default) that requests the AXI DMA channels through Linux DMAEngine,
   allocates coherent TX/RX buffers, and starts interrupt-driven cyclic MM2S
   and S2MM transfers.
 - `t510_dma_tool.c`
@@ -55,7 +55,7 @@ make
 
 This builds:
 
-- `t510_dma_loopback.ko`
+- `t510_dma_stream.ko`
 - `t510_dma_tool`
 
 ## Load and run
@@ -70,9 +70,8 @@ cd /home/linux_proj/t510_port-main/linux_app
 Then in the DMA folder, unload any previous instance before inserting the newly built module. Use module names with `rmmod`, not `.ko` filenames:
 
 ```sh
-rmmod t510_dma_loopback 2>/dev/null || true
 rmmod t510_dma_stream 2>/dev/null || true
-insmod ./t510_dma_loopback.ko
+insmod ./t510_dma_stream.ko
 ./t510_dma_tool --capture-ms 1000 --csv -
 ```
 
@@ -81,13 +80,12 @@ version of the Makefile is installed on the target:
 
 ```sh
 make unload
-insmod ./t510_dma_loopback.ko
+insmod ./t510_dma_stream.ko
 ```
 
-`Error: Driver 't510_dma_stream' is already registered` means an older
+`Error: Driver 't510_dma_stream' is already registered` means another
 `t510_dma_stream` module is still loaded and registered the same platform driver.
-Remove that old module with `rmmod t510_dma_stream` before loading
-`t510_dma_loopback.ko`.
+Remove it with `rmmod t510_dma_stream` before loading `t510_dma_stream.ko`.
 
 To save the RX capture instead of printing all samples:
 
